@@ -18,6 +18,12 @@ memory/
 *.mtl
 *.dump
 
+# --- Texture / image assets (test data, not plugin source) ---
+*.bmp
+*.png
+*.tga
+*.pcx
+
 # --- Archives ---
 *.zip
 
