@@ -1,0 +1,132 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# --- Claude / local working dirs ---
+memory/
+
+# --- 3D assets & model files (test/work artifacts, not plugin source) ---
+*.blend
+*.blend1
+*.dts
+*.DTS
+*.fbx
+*.obj
+*.mtl
+*.dump
+
+# --- Archives ---
+*.zip
+
+# --- Scratch data / logs / dumps ---
+*.txt
+*.log
+*.csv
+*.json
+
+# --- Misc working files ---
+*.bat
+
+# --- Working / export directories ---
+Package/
+TOTALPACKAGE/
+TribesSource/
+mesh_exports/
+old files/
+OBJ animations/
+
+# --- Scratch / experiment scripts (NOT part of the plugin) ---
+# The plugin itself is only: __init__.py, main.py, dts.py, dts.ksy, kaitaistruct.py
+add_animations.py
+adjust_*.py
+align_*.py
+analyze_*.py
+apply_*.py
+audit_*.py
+auto_export.py
+bake_*.py
+batch_*.py
+blender_*.py
+cap_open_edges.py
+center_*.py
+check_*.py
+clean_audit.py
+compare_*.py
+count_diffs.py
+create_*.py
+debug_*.py
+decimate_*.py
+decode_*.py
+deep_*.py
+diff_reports.py
+donor_*.py
+dts_animation_applicator.py
+dts_full_compare.py
+dts_to_blender_script.py
+dts_inspect.py
+full_parse.py
+mesh_compare.py
+dump_*.py
+export_*.py
+extract_*.py
+find_*.py
+fix_mesh_origins.py
+force_copy.py
+gen_anim_applicator.py
+get_*.py
+header_compare.py
+hex_diff.py
+import_and_replace_meshes.py
+inject_animations.py
+inspect_*.py
+list_*.py
+manual_mesh_offsets.py
+match_model_to_donor.py
+merge_*.py
+mixamo_*.py
+normalize_*.py
+parent_to_donor_skeleton.py
+patch_*.py
+perfect_hybrid.py
+position_model_on_ground.py
+prepare_*.py
+quick_compare.py
+read_shape_bounds.py
+reexport_zombie.py
+replace_*.py
+retarget_*.py
+reverse_hybrid.py
+robust_splice.py
+rotate_to_donor_pose.py
+scale_*.py
+scan_pers.py
+segment_*.py
+separate_by_vertex_groups*.py
+set_mesh_offsets.py
+show_objects.py
+simple_face_dump.py
+simulate_*.py
+slice_mesh_*.py
+smart_*.py
+splice_*.py
+split_torso_for_pelvis.py
+super_diag.py
+targeted_splice.py
+test_*.py
+thorough_audit.py
+trace_*.py
+transform_*.py
+verify_*.py
+zombie_blender_script.py
+
+# --- Markdown notes that are scratch (keep README.md tracked) ---
+MIXAMO_BONE_MAPPING.md
+MIXAMO_WORKFLOW.md
+README GUIDE.md
+blender_addon_anomalies.md
+darkstar_dts_master_reference.md
+dts_character_creation_guide.md
+handoff_report.md

@@ -1,4 +1,7 @@
-from .dts import Dts
+try:
+    from .dts import Dts
+except ImportError:
+    from dts import Dts
 import sys
 import os
 import os.path
@@ -64,11 +67,22 @@ class ImportDTS(bpy.types.Operator, ImportHelper):
     bl_description = 'Imports Starsiege: Tribes .dts file.'
 
     filter_glob : StringProperty(default="*.dts", options={'HIDDEN'})
-    filename_ext = ".dts"    
+    filename_ext = ".dts"
+    
+    import_scale: FloatProperty(
+        name="Import Scale",
+        description="Scale multiplier for imported geometry (DTS uses small units). Use 1.0 for correct round-trip export.",
+        default=1.0,
+        min=0.01,
+        max=1000.0
+    )
     
     def execute(self, context):
         global frame_id
         import re
+
+        # Force CONSTANT interpolation to prevent drift and file bloat
+        context.preferences.edit.keyframe_new_interpolation_type = 'CONSTANT'
 
         filename = self.filepath.split(os.path.sep)[-1].split('.')[0]
         path = self.filepath
@@ -76,6 +90,9 @@ class ImportDTS(bpy.types.Operator, ImportHelper):
         # Collection created, but not used yet
         obj_collection = bpy.data.collections.new(filename)
         context.scene.collection.children.link(obj_collection)
+        
+        # Store original DTS path for round-trip export (header preservation)
+        obj_collection["dts_source_file"] = path
 
         with open(path, 'r') as f:
             def store(str=''):
@@ -574,9 +591,14 @@ class ImportDTS(bpy.types.Operator, ImportHelper):
                 # Add only vertices from Frame 0, this will be our Basis
                 start_vertex = frames[0].first_vert
                 for vrt_idx in range(mesh_data.num_vertices_per_frame):
-                    # Blender - Put all the vertices in an array of [x, y, z]
-#                    array_val = [vert.x * mesh_data.frames[0].scale.x, vert.y * mesh_data.frames[0].scale.y, vert.z * mesh_data.frames[0].scale.z]
-                    array_val = [mesh_data.vertices[start_vertex + vrt_idx].x, mesh_data.vertices[start_vertex + vrt_idx].y, mesh_data.vertices[start_vertex + vrt_idx].z]
+                    # Blender - Unpack vertices using scale and origin from frame data
+                    # packed_val * scale + origin = world coordinate (then apply import scale)
+                    vert = mesh_data.vertices[start_vertex + vrt_idx]
+                    frame = frames[0]
+                    x = (vert.x * frame.scale.x + frame.origin.x) * self.import_scale
+                    y = (vert.y * frame.scale.y + frame.origin.y) * self.import_scale
+                    z = (vert.z * frame.scale.z + frame.origin.z) * self.import_scale
+                    array_val = [x, y, z]
                     array_verts_all.append(array_val)
 
                 # Faces
@@ -667,6 +689,22 @@ class ImportDTS(bpy.types.Operator, ImportHelper):
                 # Blender - Create an object with the node's id
                 mesh = bpy.data.meshes.new(obj_name)
                 object = bpy.data.objects.new(obj_name, mesh)
+                # Use node_index, NOT obj_id, to unify sort with skeleton nodes
+                object["dts_object_index"] = objects[obj_id].node_index
+                
+                # Store original DTS frame scale/origin for correct export bounds
+                # The exporter will use these instead of recalculating from geometry
+                frame = frames[0]
+                object["dts_frame_scale_x"] = frame.scale.x
+                object["dts_frame_scale_y"] = frame.scale.y
+                object["dts_frame_scale_z"] = frame.scale.z
+                object["dts_frame_origin_x"] = frame.origin.x
+                object["dts_frame_origin_y"] = frame.origin.y
+                object["dts_frame_origin_z"] = frame.origin.z
+                object["dts_import_scale"] = self.import_scale
+                object["dts_mesh_radius"] = mesh_data.radius
+                object["dts_vertex_count"] = mesh_data.num_vertices_per_frame
+                
                 actual_object_name = object.name # Blender may append a .00x
                 bpy.data.collections[filename].objects.link(object)
                 object = bpy.context.scene.objects[actual_object_name]
@@ -678,47 +716,37 @@ class ImportDTS(bpy.types.Operator, ImportHelper):
                 bpy.context.scene.cursor.rotation_euler = (0, 0, 0)
                 bpy.ops.object.origin_set(type='ORIGIN_CURSOR', center='MEDIAN')
                 
-                # Set the location and rotation of the object
-                object.location = mathutils.Vector((mesh_data.frames[0].origin.x, mesh_data.frames[0].origin.y, mesh_data.frames[0].origin.z))
+                # Vertices now contain world coordinates, don't apply additional scale/origin
+                object.scale = (1.0, 1.0, 1.0)
+                object.location = (0.0, 0.0, 0.0)  # Origin baked into vertex coords
                 object.rotation_mode = 'QUATERNION'
-                #object.rotation_quaternion = [short2float(def_trans.rotate.x), short2float(def_trans.rotate.y), short2float(def_trans.rotate.z), short2float(def_trans.rotate.w)]
+                
                 # Create the mesh of the object
                 mesh.from_pydata(array_verts_all, [], array_faces)
 
                 animate_meshes(mesh_data, obj, names, keyframes, shape_data.sequences, subsequences, bpy.data.scenes['Scene'])
-
-                object.scale = (mesh_data.frames[0].scale.x, mesh_data.frames[0].scale.y, mesh_data.frames[0].scale.z)
                 # Select object by name
                 ob = bpy.context.scene.objects[actual_object_name]  # Get the object
                 bpy.ops.object.select_all(action='DESELECT')  # Deselect all objects
                 bpy.context.view_layer.objects.active = ob  # Make the desired object the active object
                 ob.select_set(True)  # Select the object
-                # Create the face maps
+                # Create the face maps (materials for faces)
+                # Note: face_maps were removed in Blender 4.0+, using direct material assignment
                 for tex in textures:
-                    bpy.ops.object.face_map_add()
                     mat = bpy.data.materials.get(tex)
                     object.data.materials.append(mat)
 
-                # Switch object modes, not sure why we have to go into edit mode and than back to object mode
+                # Switch object modes to access polygon data
                 ob = bpy.context.active_object
                 bpy.ops.object.mode_set(mode='EDIT')
                 bpy.ops.mesh.select_mode(type="FACE")
                 bpy.ops.mesh.select_all(action='DESELECT')
                 bpy.ops.object.mode_set(mode='OBJECT')
-                # Loop through all faces and assign to face map and assign material
-                x = 0
-                for k in ob.data.polygons:
-                    ob.data.polygons[x].select = True
-                    bpy.ops.object.mode_set(mode='EDIT')
-                    ob.face_maps.active_index = int(array_faces_material[x])
-                    bpy.ops.object.face_map_assign()
-                    # Assign material
-                    bpy.context.object.active_material_index = int(array_faces_material[x])
-                    bpy.ops.object.material_slot_assign()
-                    # Deselect faces so their mapping doesn't change
-                    bpy.ops.object.face_map_deselect()
-                    bpy.ops.object.mode_set(mode='OBJECT')
-                    x += 1
+                
+                # Loop through all faces and assign material directly to polygons
+                for face_idx, poly in enumerate(ob.data.polygons):
+                    if face_idx < len(array_faces_material):
+                        poly.material_index = int(array_faces_material[face_idx])
 
                 # Create the UV map
                 new_uv = ob.data.uv_layers.new(name='UV Map')
@@ -733,8 +761,13 @@ class ImportDTS(bpy.types.Operator, ImportHelper):
                 obj = bpy.context.scene.objects.get(names[node.name])
                 if not obj:
                     object = bpy.data.objects.new(names[node.name], None)
+                    object["dts_object_index"] = nodes.index(node) # Use Node Index for sorting
                     object.rotation_mode = 'QUATERNION'
                     bpy.data.collections[filename].objects.link(object)
+                else:
+                    # Ensure existing objects (meshes) also have this if consistent
+                    # (Though they got it from obj_id, checking consistency is good)
+                    pass
                 if node.parent != -1:
                     array_val = [names[node.name], names[nodes[node.parent].name]]
                     array_parents.append(array_val)

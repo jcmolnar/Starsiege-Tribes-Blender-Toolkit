@@ -14,37 +14,45 @@
 #################################################
 
 # -------------------
-# Blender for Science
+# Tribes DTS Tools
 # -------------------
-# Add-on: import-Starsiege-Tribes
-# Author: Noxwizard and Krogoth
-# Description: Imports Starsiege: Tribes files into Blender 3.0+.
+# Add-on: Tribes DTS Import/Export
+# Author: Noxwizard, Krogoth, and Contributors
+# Description: Import and Export Starsiege: Tribes DTS files.
 
 #################################################
 
 bl_info = {
-    "name" : "Import-DTS",
-    "author" : "Noxwizard and Krogoth",
-    "description" : "Imports Starsiege: Tribes DTS files.",
+    "name" : "Tribes DTS Format",
+    "author" : "Noxwizard, Krogoth, and Contributors",
+    "description" : "Import and Export Starsiege: Tribes DTS files.",
     "blender" : (3, 0, 0),
-    "version" : (0, 0, 1),
+    "version" : (1, 0, 1),
     "location" : "File > Import-Export",
     "warning" : "",
-    "wiki_url" : "",
-    "tracker_url" : "",
+    "wiki_url" : "https://github.com/tekrog/TribesToBlender",
+    "tracker_url" : "https://github.com/tekrog/TribesToBlender/issues",
     "category" : "Import-Export"
 }
 
 import bpy
 from .main import ImportDTS
+from .export_dts import ExportDTS
 
 def menu_func_import(self, context):
-    self.layout.operator(ImportDTS.bl_idname, text="DarkStar (.dts)")
+    self.layout.operator(ImportDTS.bl_idname, text="Tribes DTS (.dts)")
+
+def menu_func_export(self, context):
+    self.layout.operator(ExportDTS.bl_idname, text="Tribes DTS (.dts)")
 
 def register():
     bpy.utils.register_class(ImportDTS)
+    bpy.utils.register_class(ExportDTS)
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
+    bpy.types.TOPBAR_MT_file_export.append(menu_func_export)
 
 def unregister():
     bpy.utils.unregister_class(ImportDTS)
+    bpy.utils.unregister_class(ExportDTS)
     bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
+    bpy.types.TOPBAR_MT_file_export.remove(menu_func_export)

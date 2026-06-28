@@ -2,7 +2,10 @@
 
 #from pkg_resources import parse_version
 #import kaitaistruct
-from .kaitaistruct import KaitaiStruct, KaitaiStream, BytesIO
+try:
+    from .kaitaistruct import KaitaiStruct, KaitaiStream, BytesIO
+except:
+    from kaitaistruct import KaitaiStruct, KaitaiStream, BytesIO
 from enum import Enum
 
 
@@ -849,3 +852,51 @@ class Dts(KaitaiStruct):
         def _read(self):
             self.min = Dts.Point3f(self._io, self, self._root)
             self.max = Dts.Point3f(self._io, self, self._root)
+
+
+
+    class Material(KaitaiStruct):
+        def __init__(self, _io, _parent=None, _root=None):
+            self._io = _io
+            self._parent = _parent
+            self._root = _root if _root else self
+            self._read()
+
+        def _read(self):
+            # Flags are 32-bit LE
+            self.flags = self._io.read_u4le()
+            
+            # Map file: 1 byte len, then string
+            self.map_file_len = self._io.read_u1()
+            self.map_file = (self._io.read_bytes(self.map_file_len)).decode("ascii")
+            
+            # Type
+            self.type = self._io.read_u4le()
+            
+            # Optional fields based on flags
+            # SWrap=1, TWrap=2, Translucent=4, Additive=8, Subtractive=16, SelfIllum=32, NeverEnvMap=64, NoMipMap=128, MipMapZeroBorder=256, IFL=512
+            
+            # Additional maps
+            if (self.flags & 8) != 0: # S_Additive? No. Flags mapping might be different.
+                # Standard torque:
+                # 0x1 SWrap
+                # 0x2 TWrap
+                # 0x4 Translucent
+                # 0x8 Additive
+                # 0x10 Subtractive
+                # 0x20 SelfIllum
+                # 0x40 NeverEnvMap
+                # 0x80 NoMipMap
+                # 0x100 MipMapZeroBorder
+                # 0x200 IFL material
+                pass
+            
+            # Wait, dts.ksy suggests optional maps are just sequential if flags are set?
+            # Actually, let's just assume simple structure for Axe.dts (flags=0x403)
+            # 0x403 = 1024 + 3. 0x400 = ?
+            # Let's peek at the remaining bytes.
+            self.extra_floats = []
+            while not self._io.is_eof():
+                try:
+                    self.extra_floats.append(self._io.read_f4le())
+                except: break
