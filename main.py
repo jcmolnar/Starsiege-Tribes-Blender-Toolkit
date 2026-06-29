@@ -590,7 +590,13 @@ class ImportDTS(bpy.types.Operator, ImportHelper):
                 elif hasattr(mesh_data, 'frames_v2'):
                     frames = mesh_data.frames_v2
 
-                if len(mesh_data.faces) == 0:
+                # Face-less meshes are the degenerate (usually 2-vert) bounding/placeholder
+                # meshes that multi-part weapons use for detail/LOD slots. Dropping them
+                # collapsed the mesh count and broke multi-mesh round-trips (the exporter's
+                # header splice then bailed with "using generated header"). Import them as
+                # verts-only placeholder objects so the structure is preserved on export.
+                # Only skip a mesh that is genuinely empty (no faces AND no vertices).
+                if len(mesh_data.faces) == 0 and mesh_data.num_vertices_per_frame == 0:
                     obj_id += 1
                     continue
 
