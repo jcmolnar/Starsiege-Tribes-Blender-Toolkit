@@ -1888,7 +1888,12 @@ class ExportDTS(bpy.types.Operator, ExportHelper):
                     materials_set[mat.name] = {
                         'flags': mat_flags,
                         'alpha': mat_alpha,
-                        'index': len(materials_set),
+                        # fIndex is the palette index for RGB materials and 0 for
+                        # TEXTURE materials (ts_material.cpp). It is NOT the material's
+                        # list position (faces reference that separately). Using the
+                        # slot number here gave non-zero indices for multi-texture
+                        # shapes, which the engine mis-handled -> crash on equip.
+                        'index': 0,
                         'rgb': (255, 255, 255),
                         'map_file': mat.name[:32],
                         'type': 0,
