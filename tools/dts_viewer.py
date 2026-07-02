@@ -90,7 +90,7 @@ def _texture_data_uri(map_file, search_dirs):
     return None
 
 
-def extract_model(path):
+def extract_model(path, texdirs=None):
     d = Dts.from_file(path)
     s = d.shape.data.obj_data
     names = [_name(n) for n in s.names]
@@ -139,7 +139,7 @@ def extract_model(path):
 
     # materials
     mats = []
-    search_dirs = [os.path.dirname(os.path.abspath(path))]
+    search_dirs = [os.path.dirname(os.path.abspath(path))] + list(texdirs or [])
     if getattr(d, 'materials', None):
         for p in d.materials.params:
             mf = _name(getattr(p, 'map_file', '') or '')
@@ -591,6 +591,9 @@ def main():
                          'Scout=flyerroot, APC=apcroot). Default: flyerroot')
     ap.add_argument('--attach', action='append', default=[],
                     help='file.dts:nodePrefix[:ox,oy,oz[:rx,ry,rz]]')
+    ap.add_argument('--texdir', action='append', default=[],
+                    help='extra folder(s) to search for textures (repeatable); '
+                         'e.g. a game skins dir for shapes whose BMPs live in .vol archives')
     args = ap.parse_args()
 
     # (path, attach-spec or None); attach = {parent, node, offset, rot}
@@ -613,7 +616,7 @@ def main():
     models = []
     for p, attach in jobs:
         print(f"parsing {p} ...")
-        models.append(extract_model(p))
+        models.append(extract_model(p, texdirs=args.texdir))
         m = models[-1]
         if attach:
             m['attach'] = attach
