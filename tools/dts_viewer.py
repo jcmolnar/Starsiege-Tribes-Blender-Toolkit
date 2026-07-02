@@ -483,9 +483,20 @@ function sampleTrack(kfs, t){
 function applyPose(){
   const si = parseInt(seqSel.value);
   builds.forEach(bd => {
+    // Mounted models with an engine pose hold their OWN pose sequence,
+    // mirroring Player::pickAnimation when mounted: mountPoint 1 plays the
+    // vehicle datablock's driverPose (Scout: 22 = "flyer root", the
+    // lean-forward pose; APC: 23 = "apc root"). Whitespace-insensitive match
+    // because DTS sequence names have spaces ("flyer root") while the engine
+    // enum doesn't (flyerroot).
+    let esi = si;
+    if (bd.M.attach && bd.M.attach.pose){
+      const key = bd.M.attach.pose.replace(/\s+/g,'').toLowerCase();
+      esi = bd.M.sequences.findIndex(s => s.name.replace(/\s+/g,'').toLowerCase() === key);
+    }
     bd.M.nodes.forEach((n,i)=>{
       const g = bd.nodeObjs[i];
-      const kfs = si >= 0 ? n.tracks[si] : null;
+      const kfs = esi >= 0 ? n.tracks[esi] : null;
       if (!kfs || !kfs.length){ applyTransform(g, bd.M.transforms[n.dt]); return; }
       const s = sampleTrack(kfs, t);
       const A = bd.M.transforms[s.a.v], B = bd.M.transforms[s.b.v];
@@ -494,7 +505,7 @@ function applyPose(){
       g.position.set(A.t[0]+(B.t[0]-A.t[0])*s.f, A.t[1]+(B.t[1]-A.t[1])*s.f, A.t[2]+(B.t[2]-A.t[2])*s.f);
     });
     bd.meshRecs.forEach(r => {
-      const kfs = si >= 0 ? r.obj.tracks[si] : null;
+      const kfs = esi >= 0 ? r.obj.tracks[esi] : null;
       let frame = 0;
       if (kfs && kfs.length){
         const s = sampleTrack(kfs, t);
@@ -575,6 +586,9 @@ def main():
                     help='.dts to mount on model 0\'s "dummy hand" (weapon equip)')
     ap.add_argument('--pilot', action='append', default=[],
                     help='.dts to mount on model 0\'s "dummy pilot" (vehicle rider)')
+    ap.add_argument('--pilot-pose', default='flyerroot',
+                    help='pose sequence the rider holds (engine driverPose; '
+                         'Scout=flyerroot, APC=apcroot). Default: flyerroot')
     ap.add_argument('--attach', action='append', default=[],
                     help='file.dts:nodePrefix[:ox,oy,oz[:rx,ry,rz]]')
     args = ap.parse_args()
@@ -586,7 +600,8 @@ def main():
                          'offset': [0, 0, 0], 'rot': [0, 0, 0]}))
     for p in args.pilot:
         jobs.append((p, {'parent': 0, 'node': 'dummy pilot',
-                         'offset': [0, 0, 0], 'rot': [0, 0, 0]}))
+                         'offset': [0, 0, 0], 'rot': [0, 0, 0],
+                         'pose': args.pilot_pose}))
     for spec in args.attach:
         parts = spec.split(':')
         path, node = parts[0], parts[1]
