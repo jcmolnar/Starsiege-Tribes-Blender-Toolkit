@@ -41,6 +41,7 @@ mat index = fMatIndex & 0x0fffffff
 FLAG_FRAME_TRACK = 0x1000
 FLAG_MATERIAL_TRACK = 0x2000
 FLAG_VISIBILITY_TRACK = 0x4000
+FLAG_VISIBILITY_VISIBLE = 0x8000  # per-keyframe: object visible from this key on
 FLAG_IS_VISIBLE = 0x8000
 
 FLAG_MATTYPE_NULL = 0x0
@@ -59,6 +60,315 @@ FLAG_TEXTURE_TRANSPARENT = 0x1000
 FLAG_TEXTURE_TRANSLUCENT = 0x2000
 
 frame_id = 0
+
+
+def _action_fcurves(anim_data):
+    """All fcurves of an action, handling both legacy and Blender 5 layered actions."""
+    if not (anim_data and anim_data.action):
+        return []
+    try:
+        return list(anim_data.action.fcurves)
+    except AttributeError:
+        fcs = []
+        for layer in anim_data.action.layers:
+            for strip in layer.strips:
+                cb = strip.channelbag(anim_data.action_slot)
+                if cb:
+                    fcs.extend(cb.fcurves)
+        return fcs
+
+
+def _parse_palette_file(path):
+    """Parse a Tribes palette into either:
+    - a dict {palette_id: 256-entry RGB list} for Darkstar PL98 multi-palettes
+      (each PBMP picks its table via its PiDX chunk -- flames/translucents use
+      different palettes than hull textures), or
+    - a plain 256-entry RGB list for single-table formats (RIFF .pal etc)."""
+    import struct
+    try:
+        with open(path, 'rb') as f:
+            buf = f.read()
+    except OSError:
+        return None
+
+    def entries_from(block):
+        pal = []
+        for e in range(256):
+            o = e * 4
+            if o + 3 > len(block):
+                return None
+            pal.append((block[o], block[o + 1], block[o + 2]))
+        return pal
+
+    # Darkstar 98 multi-palette (found in *World.vol and extracted .ppl files):
+    # 'PL98' u32 ver, u32 count, 52-byte header, then 2064-byte records with
+    # the id header at PL98+1076+2064k. IMPORTANT: each id's 256*4 RGBA color
+    # table is the 1024 bytes immediately BEFORE its id header (verified: the
+    # table before id 1135 is byte-identical to pal2MS.pal; the +12 offset
+    # used previously picked up a different table and garbled shape textures).
+    p = buf.find(b'PL98')
+    if p != -1 and len(buf) >= p + 12:
+        count = struct.unpack('<I', buf[p + 8:p + 12])[0]
+        if 0 < count <= 64:
+            pals = {}
+            for k in range(count):
+                idpos = p + 1076 + 2064 * k
+                if idpos + 4 > len(buf) or idpos - 1024 < p:
+                    break
+                pid = struct.unpack('<I', buf[idpos:idpos + 4])[0]
+                if pid == 0xFFFFFFFF:  # index-remap record, not colors
+                    continue
+                tab = entries_from(buf[idpos - 1024:idpos])
+                if tab:
+                    pals[pid] = tab
+            if pals:
+                return pals
+
+    # RIFF PAL: "RIFF" ... "data" chunk = u16 version, u16 count, then RGBFlags entries
+    if buf[:4] == b'RIFF':
+        pos = buf.find(b'data')
+        if pos != -1 and len(buf) >= pos + 8 + 4 + 256 * 4:
+            return entries_from(buf[pos + 12:pos + 12 + 256 * 4])
+        return None
+
+    # Raw fallbacks: 768 = packed RGB, 1024+ = RGBX
+    if len(buf) == 768:
+        return [(buf[i * 3], buf[i * 3 + 1], buf[i * 3 + 2]) for i in range(256)]
+    if len(buf) >= 1024:
+        return entries_from(buf[:1024])
+    return None
+
+
+def _find_palette(dts_dir):
+    """Find the palette for a model with no guesswork. Preference order:
+    1. a .ppl next to the .dts (explicit user choice),
+    2. the game's PL98 multi-palette auto-located by walking up from the
+       .dts folder to the Tribes install and reading *World.vol directly
+       (lushWorld preferred -- the classic look; ids are the same in every
+       world, only the lighting tint differs),
+    3. a single-table .pal next to the .dts (pal2MS preferred; it matches
+       the hull palette but can't color flames/translucents)."""
+    import glob
+
+    candidates = sorted(glob.glob(os.path.join(dts_dir, '*.ppl')))
+
+    # Auto-locate *World.vol: the dts usually lives in <Tribes>/<something>/,
+    # with the vols in <Tribes>/base/. Check each ancestor dir and its base/.
+    vols = []
+    d = os.path.abspath(dts_dir)
+    for _ in range(6):
+        for vol_dir in (d, os.path.join(d, 'base')):
+            if os.path.isdir(vol_dir):
+                found = sorted(glob.glob(os.path.join(vol_dir, '*World.vol')),
+                               key=lambda fn: (os.path.basename(fn).lower() != 'lushworld.vol',))
+                for fn in found:
+                    if fn not in vols:
+                        vols.append(fn)
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    candidates += vols
+
+    pals = sorted(glob.glob(os.path.join(dts_dir, '*.pal')))
+    candidates += sorted(pals, key=lambda fn: (os.path.basename(fn).lower() != 'pal2ms.pal',))
+
+    for fn in candidates:
+        pal = _parse_palette_file(fn)
+        if pal:
+            print("Using palette: {}".format(fn))
+            return pal
+    return None
+
+
+_vol_index_cache = {}
+
+
+def _vol_file_index(volpath):
+    """Filename -> (data offset, size) index of a PVOL archive (cached)."""
+    import struct
+    if volpath in _vol_index_cache:
+        return _vol_index_cache[volpath]
+    idx = {}
+    try:
+        with open(volpath, 'rb') as f:
+            b = f.read()
+        if b[:4] == b'PVOL':
+            dirofs = struct.unpack('<I', b[4:8])[0]
+            if b[dirofs:dirofs + 4] == b'vols':
+                nsize = struct.unpack('<I', b[dirofs + 4:dirofs + 8])[0]
+                names_blk = b[dirofs + 8:dirofs + 8 + nsize]
+                ip = b.find(b'voli', dirofs + 8 + nsize - 4)
+                if ip != -1:
+                    isize = struct.unpack('<I', b[ip + 4:ip + 8])[0]
+                    ib = b[ip + 8:ip + 8 + isize]
+                    for off in range(0, len(ib) - 16, 17):
+                        _z, name_ofs, data_ofs, size = struct.unpack('<4I', ib[off:off + 16])
+                        end = names_blk.find(b'\0', name_ofs)
+                        nm = names_blk[name_ofs:end].decode('latin-1').lower()
+                        idx[nm] = (data_ofs, size)
+    except Exception as e:
+        print("Could not index {}: {}".format(volpath, e))
+    _vol_index_cache[volpath] = idx
+    return idx
+
+
+def _load_from_vols(filename, dts_dir):
+    """Fetch a file's raw bytes from any game .vol reachable from dts_dir
+    (the model's folder, its ancestors, and their base/ subfolders)."""
+    import struct, glob
+    target = filename.lower()
+    vol_dirs = []
+    d = os.path.abspath(dts_dir)
+    for _ in range(6):
+        for vd in (d, os.path.join(d, 'base')):
+            if os.path.isdir(vd) and vd not in vol_dirs:
+                vol_dirs.append(vd)
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    for vd in vol_dirs:
+        for vol in sorted(glob.glob(os.path.join(vd, '*.vol'))):
+            idx = _vol_file_index(vol)
+            if target in idx:
+                data_ofs, size = idx[target]
+                with open(vol, 'rb') as f:
+                    f.seek(data_ofs)
+                    head = f.read(8)
+                    if head[:4] != b'VBLK':
+                        f.seek(data_ofs)
+                    payload = f.read(size)
+                print("Texture {} extracted from {}".format(filename, vol))
+                return payload
+    return None
+
+
+def _decode_pbmp(path, palette):
+    """Decode a Dynamix PBMP file into (width, height, RGBA float list) or None."""
+    try:
+        with open(path, 'rb') as f:
+            buf = f.read()
+    except OSError:
+        return None
+    return _decode_pbmp_bytes(buf, palette)
+
+
+def _decode_pbmp_bytes(buf, palette):
+    """Decode Dynamix PBMP bytes into (width, height, RGBA float list) or None."""
+    import struct
+    if buf[:4] != b'PBMP':
+        return None
+
+    w = h = None
+    data = None
+    pidx = None
+    pos = 8
+    # Chunk sizes in these files are unreliable (head/data can overrun the
+    # declared PBMP size), so walk tags defensively over the whole file.
+    while pos + 8 <= len(buf):
+        tag = buf[pos:pos + 4]
+        size = struct.unpack('<I', buf[pos + 4:pos + 8])[0]
+        body = buf[pos + 8:pos + 8 + size]
+        if tag == b'head' and size >= 16:
+            _ver, w, h, _depth = struct.unpack('<4I', body[:16])
+        elif tag == b'data':
+            data = body
+        elif tag == b'PiDX' and size >= 4:
+            pidx = struct.unpack('<I', body[:4])[0]
+        pos += 8 + size
+
+    if not (w and h and data) or len(data) < w * h:
+        return None
+
+    # Multi-palette (PL98): the PBMP's PiDX chunk picks its table -- hull
+    # textures, flames, and translucents each use a different palette id.
+    if isinstance(palette, dict):
+        table = palette.get(pidx)
+        if table is None and palette:
+            table = next(iter(palette.values()))
+            print("  palette id {} not in palette file; using first table".format(pidx))
+    else:
+        table = palette
+
+    pixels = [0.0] * (w * h * 4)
+    for y in range(h):
+        src = y * w
+        dst = (h - 1 - y) * w * 4  # Blender images are bottom-up
+        for x in range(w):
+            idx = data[src + x]
+            r, g, b = table[idx] if table else (idx, idx, idx)
+            o = dst + x * 4
+            pixels[o] = r / 255.0
+            pixels[o + 1] = g / 255.0
+            pixels[o + 2] = b / 255.0
+            # pure magenta is the Darkstar transparency key
+            pixels[o + 3] = 0.0 if (r, g, b) == (255, 0, 255) else 1.0
+    return w, h, pixels
+
+
+def load_dts_image(image_path, palette=None):
+    """Load a texture for a DTS material with no manual extraction needed.
+    Tries, in order: a .png next to the .dts, a .bmp on disk (standard BMP via
+    Blender, Dynamix PBMP via our decoder + palette), and finally the game's
+    .vol archives (auto-located from the .dts path). Returns a bpy image or None."""
+    base = image_path.rsplit('.', 1)[0]
+    name = os.path.basename(base) + '.bmp'
+
+    png_path = base + '.png'
+    if os.path.exists(png_path):
+        return bpy.data.images.load(png_path, check_existing=False)
+
+    def _image_from_decoded(decoded, img_name):
+        w, h, pixels = decoded
+        image = bpy.data.images.new(img_name, width=w, height=h, alpha=True)
+        image.colorspace_settings.name = 'sRGB'
+        image.pixels = pixels
+        image.pack()
+        if palette is None:
+            print("PBMP decoded WITHOUT palette (grayscale): {} -- no game "
+                  "*World.vol or .ppl/.pal palette was found".format(img_name))
+        return image
+
+    bmp_path = None
+    for ext in ('.bmp', '.BMP'):
+        if os.path.exists(base + ext):
+            bmp_path = base + ext
+            break
+    if bmp_path is not None:
+        with open(bmp_path, 'rb') as f:
+            magic = f.read(4)
+        if magic[:2] == b'BM':  # standard BMP, Blender handles it
+            return bpy.data.images.load(bmp_path, check_existing=False)
+        decoded = _decode_pbmp(bmp_path, palette)
+        if decoded is None:
+            print("Could not decode texture: {}".format(bmp_path))
+            return None
+        return _image_from_decoded(decoded, os.path.basename(bmp_path))
+
+    # Not on disk: pull it straight out of the game's .vol archives
+    payload = _load_from_vols(name, os.path.dirname(image_path))
+    if payload is None:
+        return None
+    if payload[:2] == b'BM':
+        # standard BMP: Blender can only load from a file, so bounce it
+        # through a temp file and pack the result into the .blend
+        import tempfile
+        tmp = os.path.join(tempfile.gettempdir(), name)
+        with open(tmp, 'wb') as f:
+            f.write(payload)
+        image = bpy.data.images.load(tmp, check_existing=False)
+        image.pack()
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return image
+    decoded = _decode_pbmp_bytes(payload, palette)
+    if decoded is None:
+        print("Could not decode vol texture: {}".format(name))
+        return None
+    return _image_from_decoded(decoded, name)
 
 
 class ImportDTS(bpy.types.Operator, ImportHelper):
@@ -86,6 +396,10 @@ class ImportDTS(bpy.types.Operator, ImportHelper):
 
     def execute(self, context):
         global frame_id
+        # Module-level counter survives across imports in one Blender session;
+        # without a reset, a re-import keys its animation starting where the
+        # previous import ended (thousands of frames out on the timeline).
+        frame_id = 0
         import re
 
         # Force CONSTANT interpolation to prevent drift and file bloat
@@ -93,6 +407,10 @@ class ImportDTS(bpy.types.Operator, ImportHelper):
 
         filename = self.filepath.split(os.path.sep)[-1].split('.')[0]
         path = self.filepath
+
+        # Palette for decoding Dynamix PBMP-format .bmp textures (any .ppl/.pal
+        # in the model's folder); None -> PBMPs decode as grayscale
+        dts_palette = _find_palette(os.path.dirname(self.filepath))
         
         # Collection created, but not used yet
         obj_collection = bpy.data.collections.new(filename)
@@ -148,7 +466,7 @@ class ImportDTS(bpy.types.Operator, ImportHelper):
                     create_nodes(nodes[child], nodes, transforms, node_tree)
 
 
-            def animate_meshes(mesh, obj, names, keyframes, sequences, subsequences, scene):
+            def animate_meshes(mesh, obj, names, keyframes, sequences, subsequences, scene, blender_name):
                 global frame_id
 
                 if not obj.num_subsequences:
@@ -177,7 +495,10 @@ class ImportDTS(bpy.types.Operator, ImportHelper):
                 isMaterialTrackKeyframe = keyframes[first_keyframe].mat_index & FLAG_MATERIAL_TRACK
                 isVisibilityTrack = keyframes[first_keyframe].mat_index & FLAG_VISIBILITY_TRACK
 
-                object = bpy.context.scene.objects[names[obj.name]]
+                # Look up by the ACTUAL Blender name (may have a .00x suffix on
+                # re-import) -- a plain DTS-name lookup can hit a stale object
+                # from a previous import and bind the animation to it.
+                object = bpy.context.scene.objects[blender_name]
                 if isFrameTrackKeyframe:
                     print('Frame track!!!')
                     # Morph frames were already imported as correctly-decoded
@@ -255,9 +576,12 @@ class ImportDTS(bpy.types.Operator, ImportHelper):
                             if keyframes[first_keyframe].mat_index not in ifl_materials:
                                 ifl_materials[keyframes[first_keyframe].mat_index] = 'ifl_{}_{}'.format(seq_name, subseq_count)
 
-                            # Texture nodes
+                            # Texture nodes. One entry per KEYFRAME (repeats
+                            # share a node) -- the mix chain below switches
+                            # between entries by frame index.
                             texture_nodes = []
                             ifl_sequence = []
+                            node_by_path = {}
                             node_num = 0
                             for key in range(first_keyframe, first_keyframe + subseq.num_keyframes):
                                 # The material index represents the default material, while the key_value represents the new material to replace it with
@@ -271,30 +595,29 @@ class ImportDTS(bpy.types.Operator, ImportHelper):
                                 image_path = image_path.rsplit('.', 1)[0] + ".png"
                                 ifl_sequence.append(image_path)
 
-                                # See if we've already made a texture node and re-use it
-                                for tex in texture_nodes:
-                                    if tex.image.filepath == image_path:
-                                        texture_nodes.append(tex)
-                                        break
-                                else:
-                                    # Make a new texture shader
-                                    image = None
-                                    if os.path.exists(image_path):
-                                        image = bpy.data.images.load(image_path, check_existing=False)
-                                    else:
-                                        print("Missing image: {}".format(image_path))
+                                # Re-use the texture node if this frame repeats an image
+                                if image_path in node_by_path:
+                                    texture_nodes.append(node_by_path[image_path])
+                                    continue
 
-                                    shader_node = shader_nodes.new("ShaderNodeTexImage")
+                                # Make a new texture shader
+                                image = load_dts_image(image_path, dts_palette)
+                                if image is None:
+                                    print("Missing image: {}".format(image_path))
 
-                                    if image:
-                                        image.name = new_map  # "sequence_{}_{}".format(seq_name, ifl_frame_id)
-                                        image.use_fake_user = True
-                                        shader_node.image = image
+                                shader_node = shader_nodes.new("ShaderNodeTexImage")
+
+                                if image:
+                                    image.name = new_map  # "sequence_{}_{}".format(seq_name, ifl_frame_id)
+                                    image.use_fake_user = True
+                                    shader_node.image = image
+                                    if image.filepath:  # packed PBMP images have no file source
                                         shader_node.image.source = "FILE"
 
-                                    shader_node.location = node_num * 250, 100
-                                    texture_nodes.append(shader_node)
-                                    node_num += 1
+                                shader_node.location = node_num * 250, 100
+                                node_by_path[image_path] = shader_node
+                                texture_nodes.append(shader_node)
+                                node_num += 1
 
                             # Create mix and math nodes
                             prev_mix_node_color = None
@@ -357,7 +680,22 @@ class ImportDTS(bpy.types.Operator, ImportHelper):
                             mat_flags = d.materials.params[keyframes[first_keyframe].key_value].flags
                             if mat_flags & FLAG_TEXTURE_TRANSPARENT == FLAG_TEXTURE_TRANSPARENT or mat_flags & FLAG_TEXTURE_TRANSLUCENT == FLAG_TEXTURE_TRANSLUCENT:
                                 ifl_mat.blend_method = "BLEND"
-                                shader_links.new(prev_mix_node_alpha.outputs["Color"], bsdf_node.inputs["Alpha"])
+                                if mat_flags & FLAG_TEXTURE_TRANSLUCENT == FLAG_TEXTURE_TRANSLUCENT:
+                                    # additive in-engine: luminance-as-alpha + emissive
+                                    lum = shader_nodes.new("ShaderNodeRGBToBW")
+                                    lum.location = bsdf_node.location[0] - 200, -150
+                                    shader_links.new(prev_mix_node_color.outputs["Color"], lum.inputs["Color"])
+                                    amul = shader_nodes.new("ShaderNodeMath")
+                                    amul.operation = 'MULTIPLY'
+                                    amul.location = bsdf_node.location[0] - 50, -150
+                                    shader_links.new(lum.outputs["Val"], amul.inputs[0])
+                                    shader_links.new(prev_mix_node_alpha.outputs["Color"], amul.inputs[1])
+                                    shader_links.new(amul.outputs["Value"], bsdf_node.inputs["Alpha"])
+                                    if "Emission Color" in bsdf_node.inputs:
+                                        shader_links.new(prev_mix_node_color.outputs["Color"], bsdf_node.inputs["Emission Color"])
+                                        bsdf_node.inputs["Emission Strength"].default_value = 1.0
+                                else:
+                                    shader_links.new(prev_mix_node_alpha.outputs["Color"], bsdf_node.inputs["Alpha"])
 
                             mat_out_node = shader_nodes.get("Material Output")
                             mat_out_node.location = bsdf_node.location[0] + 300, bsdf_node.location[1]
@@ -470,22 +808,39 @@ class ImportDTS(bpy.types.Operator, ImportHelper):
                             image_path = os.path.abspath(
                                 os.path.dirname(self.filepath) + os.path.sep + bitmap_name.decode('ascii'))
 
-                            # Check if .png exists
-                            if os.path.exists(image_path):
-                                shader_node.image = bpy.data.images.load(image_path)
-                                pngORbmp = ".png"
-                            # Check if .bmp exists
+                            # Try .png, standard .bmp, or Dynamix PBMP .bmp
+                            loaded_image = load_dts_image(image_path, dts_palette)
+                            if loaded_image:
+                                shader_node.image = loaded_image
                             else:
-                                image_path = image_path.rsplit('.', 1)[0] + ".bmp"
-                                if os.path.exists(image_path):
-                                    shader_node.image = bpy.data.images.load(image_path)
-                                    pngORbmp = ".bmp"
+                                print("Missing image: {}".format(image_path))
                             # Link the image texture node to the color slot on the BSDF node
                             links = mat.node_tree.links
-                            link = links.new(shader_node.outputs["Color"], mat_nodes["Principled BSDF"].inputs[0])
+                            bsdf = mat_nodes["Principled BSDF"]
+                            link = links.new(shader_node.outputs["Color"], bsdf.inputs[0])
 
-                            # Link the alpha input/output
-                            links.new(shader_node.outputs["Alpha"], mat_nodes["Principled BSDF"].inputs[21])
+                            if param.flags & FLAG_TEXTURE_TRANSLUCENT == FLAG_TEXTURE_TRANSLUCENT:
+                                # The engine draws translucent materials
+                                # (muzzle flashes, engine flames) additively:
+                                # black contributes nothing. Approximate that
+                                # with luminance-as-alpha and an emissive
+                                # color so it glows like in game.
+                                lum = mat_nodes.new("ShaderNodeRGBToBW")
+                                lum.location = -400, -100
+                                links.new(shader_node.outputs["Color"], lum.inputs["Color"])
+                                amul = mat_nodes.new("ShaderNodeMath")
+                                amul.operation = 'MULTIPLY'
+                                amul.location = -200, -100
+                                links.new(lum.outputs["Val"], amul.inputs[0])
+                                links.new(shader_node.outputs["Alpha"], amul.inputs[1])
+                                links.new(amul.outputs["Value"], bsdf.inputs["Alpha"])
+                                if "Emission Color" in bsdf.inputs:
+                                    links.new(shader_node.outputs["Color"], bsdf.inputs["Emission Color"])
+                                    bsdf.inputs["Emission Strength"].default_value = 1.0
+                                mat.show_transparent_back = False
+                            else:
+                                # Link the alpha input/output
+                                links.new(shader_node.outputs["Alpha"], bsdf.inputs[21])
 
                         textures.append(mat.name)
                     else:
@@ -739,8 +1094,24 @@ class ImportDTS(bpy.types.Operator, ImportHelper):
                     object["dts_frame_scales"] = _scales
                     object["dts_frame_origins"] = _origins
                 
+                # The bounds/collision helper meshes aren't part of the visible
+                # model -- draw them as wireframe so they don't render as
+                # untextured boxes around the shape (they still export).
+                if obj_name.lower() in ('bounds', 'collision'):
+                    object.display_type = 'WIRE'
+                    object.hide_render = True
+
+                # Object flag 0x1 = hidden by default (e.g. "hide muzzle"
+                # flash meshes, shown only by a visibility track during
+                # "fire"). Stored here; the actual hiding happens after all
+                # mesh editing (edit-mode ops can't run on hidden objects).
+                object["dts_object_flags"] = int(objects[obj_id].flags)
+
                 actual_object_name = object.name # Blender may append a .00x
-                bpy.data.collections[filename].objects.link(object)
+                # Link via the collection REFERENCE, not by name: on re-import the
+                # new collection may be named "file.001" and a name lookup would
+                # put objects into the leftover old collection.
+                obj_collection.objects.link(object)
                 object = bpy.context.scene.objects[actual_object_name]
                 obj_dts_to_blender_map[obj_id] = actual_object_name
                 object.data = mesh
@@ -770,6 +1141,11 @@ class ImportDTS(bpy.types.Operator, ImportHelper):
                         f_sc = getattr(fr, 'scale', None) or getattr(mesh_data, 'scale_v2', None)
                         f_og = getattr(fr, 'origin', None) or getattr(mesh_data, 'origin_v2', None)
                         key = object.shape_key_add(name='frame_{:03d}'.format(f_idx), from_mix=False)
+                        # Blender 5.x adds shape keys with value 1.0 -- with 35
+                        # relative keys all active the mesh becomes a stacked
+                        # spike. They must start at 0 (the sequence loop
+                        # animates them).
+                        key.value = 0.0
                         if not (f_sc and f_og):
                             continue
                         f_start = fr.first_vert
@@ -781,7 +1157,12 @@ class ImportDTS(bpy.types.Operator, ImportHelper):
                                 (vert.z * f_sc.z + f_og.z) * self.import_scale)
                     print(f"  Imported {mesh_data.num_frames - 1} morph frame(s) as shape keys for '{obj_name}'")
 
-                animate_meshes(mesh_data, obj, names, keyframes, shape_data.sequences, subsequences, bpy.data.scenes['Scene'])
+                # NOTE: object-level animation (vertex-morph frame tracks) is
+                # handled in the main sequence loop below so the keys share the
+                # sequence's timeline range. The old per-mesh animate_meshes()
+                # call only ever processed the object's FIRST subsequence (so a
+                # leading visibility track hid the deploy morph entirely) and
+                # laid keys on its own drifting frame counter.
                 # Select object by name
                 ob = bpy.context.scene.objects[actual_object_name]  # Get the object
                 bpy.ops.object.select_all(action='DESELECT')  # Deselect all objects
@@ -813,22 +1194,31 @@ class ImportDTS(bpy.types.Operator, ImportHelper):
                 obj_id += 1
 
             # Blender - Create Objects for all nodes, with dummy meshes, find parents
-            array_parents = []   
+            # Map each DTS node index to the ACTUAL Blender object name created by
+            # THIS import. All later lookups go through this map instead of raw
+            # scene name lookups, which could resolve to stale same-named objects
+            # from a previous import (breaking parenting and animation).
+            created_mesh_by_dts_name = {}
+            for _oid, _bname in obj_dts_to_blender_map.items():
+                created_mesh_by_dts_name.setdefault(names[objects[_oid].name], _bname)
+
+            node_blender_map = {}
             for node in nodes:
-                obj = bpy.context.scene.objects.get(names[node.name])
-                if not obj:
-                    object = bpy.data.objects.new(names[node.name], None)
-                    object["dts_object_index"] = nodes.index(node) # Use Node Index for sorting
+                dts_name = names[node.name]
+                blender_name = created_mesh_by_dts_name.get(dts_name)
+                if blender_name is None:
+                    object = bpy.data.objects.new(dts_name, None)
+                    object["dts_object_index"] = node.id # Use Node Index for sorting
                     object.rotation_mode = 'QUATERNION'
-                    bpy.data.collections[filename].objects.link(object)
-                else:
-                    # Ensure existing objects (meshes) also have this if consistent
-                    # (Though they got it from obj_id, checking consistency is good)
-                    pass
+                    obj_collection.objects.link(object)
+                    blender_name = object.name # Blender may append a .00x
+                node_blender_map[node.id] = blender_name
+
+            array_parents = []
+            for node in nodes:
                 if node.parent != -1:
-                    array_val = [names[node.name], names[nodes[node.parent].name]]
-                    array_parents.append(array_val)
-                    
+                    array_parents.append([node_blender_map[node.id], node_blender_map[node.parent]])
+
             # Blender - Find parents for all objects
             pprint.pp(obj_dts_to_blender_map)
             for obj_id in range(len(objects)):
@@ -837,8 +1227,9 @@ class ImportDTS(bpy.types.Operator, ImportHelper):
                 if obj_id not in obj_dts_to_blender_map:
                     continue
 
-                array_val = [obj_dts_to_blender_map[obj_id], names[nodes[obj.node_index].name]]
-                array_parents.append(array_val)
+                array_val = [obj_dts_to_blender_map[obj_id], node_blender_map[obj.node_index]]
+                if array_val[0] != array_val[1]: # mesh may BE its own node
+                    array_parents.append(array_val)
                 print(obj_id, obj_dts_to_blender_map[obj_id], obj.node_index, names[nodes[obj.node_index].name])
                         
             # Blender - Parent all the objects
@@ -855,7 +1246,7 @@ class ImportDTS(bpy.types.Operator, ImportHelper):
             # Blender - Move the nodes
             for node in nodes:
                 def_trans = transforms[nodes[node.id].default_transform]
-                object = bpy.context.scene.objects[names[nodes[node.id].name]]
+                object = bpy.context.scene.objects[node_blender_map[node.id]]
                 object.location = [def_trans.translate.x, def_trans.translate.y, def_trans.translate.z]
                 #object.rotation_quaternion = [short2float(def_trans.rotate.x), short2float(def_trans.rotate.y), short2float(def_trans.rotate.z), short2float(def_trans.rotate.w)]
                 object.rotation_quaternion = [short2float(def_trans.rotate.w) * -1, short2float(def_trans.rotate.x), short2float(def_trans.rotate.y), short2float(def_trans.rotate.z)]
@@ -893,12 +1284,37 @@ class ImportDTS(bpy.types.Operator, ImportHelper):
             # Create the sequences
             scene = bpy.data.scenes['Scene']
 
+            # Apply default-hidden object flags (bit 0x1) now that all mesh
+            # editing is done: key the hidden state at frame 0 so visibility
+            # tracks animate from the right base state.
+            scene.frame_set(0)
+            for _bname in obj_dts_to_blender_map.values():
+                _ob = bpy.context.scene.objects.get(_bname)
+                if _ob is None or not (_ob.get("dts_object_flags", 0) & 1):
+                    continue
+                _ob.hide_viewport = True
+                _ob.hide_render = True
+                _ob.keyframe_insert(data_path="hide_viewport")
+                _ob.keyframe_insert(data_path="hide_render")
+
             # Iterate through all sequences and generate key frames for each object participating in that sequence
             for seq_id in range(len(shape_data.sequences)):
-                # Before starting a sequence, reset all nodes to their default transform
+                # Before starting a sequence, reset nodes to their default
+                # transform -- but ONLY nodes that this sequence animates.
+                # Sequences without a node track (e.g. the jammer's "power",
+                # which plays on the DEPLOYED shape) must not yank nodes back
+                # to the rest pose at their boundary.
+                scene.frame_set(frame_id)
                 for node in nodes:
+                    participates = False
+                    for _sc in range(node.num_subsequences):
+                        if subsequences[node.first_subsequence + _sc].sequence_index == seq_id:
+                            participates = True
+                            break
+                    if not participates:
+                        continue
                     def_trans = transforms[nodes[node.id].default_transform]
-                    object = bpy.context.scene.objects[names[nodes[node.id].name]]
+                    object = bpy.context.scene.objects[node_blender_map[node.id]]
                     object.location = [def_trans.translate.x, def_trans.translate.y, def_trans.translate.z]
                     object.rotation_quaternion = [short2float(def_trans.rotate.w) * -1, short2float(def_trans.rotate.x), short2float(def_trans.rotate.y), short2float(def_trans.rotate.z)]
                     object.keyframe_insert(data_path="rotation_quaternion", index=-1)
@@ -925,9 +1341,13 @@ class ImportDTS(bpy.types.Operator, ImportHelper):
 
                         val = 0
                         for key in range(first_keyframe, first_keyframe + subseq.num_keyframes):
+                            # Set the frame BEFORE inserting: keyframe_insert keys
+                            # at the CURRENT frame, so the old order put every key
+                            # one step behind (and the first key wherever the
+                            # playhead happened to be).
+                            scene.frame_set(frame_id)
                             value_node.outputs["Value"].default_value = val
                             value_node.outputs["Value"].keyframe_insert(data_path="default_value", index=-1)
-                            scene.frame_set(frame_id)
                             val += 1
                             frame_id += 1
 
@@ -948,7 +1368,7 @@ class ImportDTS(bpy.types.Operator, ImportHelper):
 
                                     #Blender
                                     blender_frame = frame_id
-                                    object = bpy.context.scene.objects[str(names[nodes[node_id].name])]
+                                    object = bpy.context.scene.objects[node_blender_map[node_id]]
                                     # Actions will be created for each object animated. Bones will need to be created to be used with armors.
                                     #object.animation_data_create() #
                                     #object.animation_data.action = bpy.data.actions.new(name=seq_name) #
@@ -963,55 +1383,172 @@ class ImportDTS(bpy.types.Operator, ImportHelper):
                                     last_subseq_len = subseq.num_keyframes
 
                         node_id += 1
+
+                    # Object tracks: vertex-morph (frame track) subsequences.
+                    # Keys go at this sequence's frame range, one morph frame
+                    # per timeline frame, exactly one shape key active at a time.
+                    for obj_i in range(len(objects)):
+                        obj_rec = objects[obj_i]
+                        if not obj_rec.num_subsequences or obj_i not in obj_dts_to_blender_map:
+                            continue
+                        for ss in range(obj_rec.num_subsequences):
+                            subseq = subsequences[obj_rec.first_subsequence + ss]
+                            if subseq.sequence_index != seq_id:
+                                continue
+                            first_keyframe = subseq.first_keyframe
+
+                            # Visibility track: key hide_viewport/hide_render so
+                            # e.g. muzzle flashes only show during "fire",
+                            # returning to the object's default state after.
+                            # The visible state is mat_index bit 0x8000 (NOT
+                            # key_value), and each key has a fractional
+                            # position within the sequence -- honor it so keys
+                            # stay inside this sequence's frame range instead
+                            # of spilling into the next one.
+                            if keyframes[first_keyframe].mat_index & FLAG_VISIBILITY_TRACK:
+                                ob = bpy.context.scene.objects[obj_dts_to_blender_map[obj_i]]
+                                seq_len = max(last_subseq_len, subseq.num_keyframes + 1)
+                                for key in range(first_keyframe, first_keyframe + subseq.num_keyframes):
+                                    kf = keyframes[key]
+                                    hidden = not (kf.mat_index & FLAG_VISIBILITY_VISIBLE)
+                                    pos = getattr(kf, 'position', 0.0) or 0.0
+                                    scene.frame_set(frame_id + int(round(pos * seq_len)))
+                                    ob.hide_viewport = hidden
+                                    ob.hide_render = hidden
+                                    ob.keyframe_insert(data_path="hide_viewport")
+                                    ob.keyframe_insert(data_path="hide_render")
+                                default_hidden = bool(ob.get("dts_object_flags", 0) & 1)
+                                scene.frame_set(frame_id + seq_len)
+                                ob.hide_viewport = default_hidden
+                                ob.hide_render = default_hidden
+                                ob.keyframe_insert(data_path="hide_viewport")
+                                ob.keyframe_insert(data_path="hide_render")
+                                for fc in _action_fcurves(ob.animation_data):
+                                    if fc.data_path.startswith('hide'):
+                                        for kp in fc.keyframe_points:
+                                            kp.interpolation = 'CONSTANT'
+                                last_subseq_len = max(last_subseq_len, seq_len)
+                                continue
+
+                            if not (keyframes[first_keyframe].mat_index & FLAG_FRAME_TRACK):
+                                continue
+                            ob = bpy.context.scene.objects[obj_dts_to_blender_map[obj_i]]
+                            sk_data = ob.data.shape_keys
+                            if not sk_data:
+                                print('  frame track on {} but no shape keys; skipped'.format(ob.name))
+                                continue
+                            sk_data.use_relative = True
+
+                            # key_value is the morph frame index; frame 0 is the
+                            # Basis (represented as None -> all keys off).
+                            # Each key carries a fractional position within the
+                            # sequence -- place it there so the morph spans the
+                            # sequence's full frame range like in the engine.
+                            seq_len_ft = max(last_subseq_len, subseq.num_keyframes)
+                            entries = []
+                            for key in range(first_keyframe, first_keyframe + subseq.num_keyframes):
+                                kf = keyframes[key]
+                                sk = sk_data.key_blocks.get('frame_{:03d}'.format(kf.key_value))
+                                pos = getattr(kf, 'position', 0.0) or 0.0
+                                entries.append((frame_id + int(round(pos * seq_len_ft)), sk))
+                            if all(fr == entries[0][0] for fr, _ in entries):
+                                # no usable positions; fall back to sequential
+                                entries = [(frame_id + n, sk) for n, (_, sk) in enumerate(entries)]
+
+                            # Anchor every used key at 0 at the sequence start:
+                            # without this, fcurve extrapolation holds a key's
+                            # FIRST keyed value (1) backwards to frame 0 and the
+                            # relative keys stack into stretched geometry.
+                            scene.frame_set(frame_id)
+                            for sk in set(s for _, s in entries if s is not None):
+                                sk.value = 0
+                                sk.keyframe_insert(data_path="value", index=-1)
+
+                            prev_sk = None
+                            for fr, sk in entries:
+                                scene.frame_set(fr)
+                                if sk != prev_sk:
+                                    if prev_sk is not None:
+                                        prev_sk.value = 0
+                                        prev_sk.keyframe_insert(data_path="value", index=-1)
+                                    if sk is not None:
+                                        sk.value = 1
+                                        sk.keyframe_insert(data_path="value", index=-1)
+                                    prev_sk = sk
+
+                            # Morph switching must be a hard step: the
+                            # keyframe_new_interpolation_type preference is
+                            # ignored by keyframe_insert in Blender 5, and
+                            # BEZIER ramps leave a dozen relative keys partially
+                            # active at once (stretched-spike geometry).
+                            for fc in _action_fcurves(sk_data.animation_data):
+                                for kp in fc.keyframe_points:
+                                    kp.interpolation = 'CONSTANT'
+                            last_subseq_len = max(last_subseq_len, subseq.num_keyframes)
+
                     frame_id += last_subseq_len
                 scene.timeline_markers.new('End of {}'.format(seq_name), frame=frame_id)
-        
+
+            # Extend the playback range to cover every imported sequence
+            # (Blender's default End of 250 cuts the loop off partway through).
+            scene.frame_start = 0
+            if scene.frame_end < frame_id:
+                scene.frame_end = frame_id
+            scene.frame_set(0)
+
         # =========================================================================
         # LOD ORGANIZATION: Create collections for each LOD level
         # =========================================================================
         if self.organize_by_lod:
-            lod_collections = {
-                '36': 'LOD_36_High',
-                '10': 'LOD_10_Medium', 
-                '2': 'LOD_02_Low',
-                'other': 'LOD_Other'
-            }
-            
-            # Create LOD collections if they don't exist
-            for key, name in lod_collections.items():
-                if name not in bpy.data.collections:
+            # Use the shape's ACTUAL detail sizes (characters are 36/10/2, but
+            # deployables use e.g. 15/4/1) instead of hardcoded buckets. Only
+            # organize the meshes created by THIS import.
+            try:
+                detail_sizes = sorted({int(d.size) for d in shape_data.details}, reverse=True)
+            except NameError:
+                detail_sizes = []
+            rank_labels = ['High', 'Medium', 'Low']
+            size_to_coll = {}
+            for rank, size in enumerate(detail_sizes):
+                label = rank_labels[rank] if rank < len(rank_labels) else 'L{}'.format(rank)
+                size_to_coll[size] = 'LOD_{:02d}_{}'.format(size, label)
+
+            def _get_lod_coll(name):
+                coll = bpy.data.collections.get(name)
+                if coll is None:
                     coll = bpy.data.collections.new(name)
                     context.scene.collection.children.link(coll)
-            
-            # Get references to collections
-            collections = {k: bpy.data.collections[v] for k, v in lod_collections.items()}
-            
-            # Move mesh objects to appropriate LOD collections
-            moved_counts = {'36': 0, '10': 0, '2': 0, 'other': 0}
-            for obj in list(bpy.data.objects):
-                if obj.type != 'MESH':
+                return coll
+
+            moved_counts = {}
+            for actual_name in obj_dts_to_blender_map.values():
+                obj = bpy.context.scene.objects.get(actual_name)
+                if obj is None or obj.type != 'MESH':
                     continue
-                
-                name = obj.name
-                lod = 'other'
-                if name.endswith(' 36') or name.endswith('36'):
-                    lod = '36'
-                elif name.endswith(' 10') or name.endswith('10'):
-                    lod = '10'
-                elif name.endswith(' 2') or name.endswith('2'):
-                    lod = '2'
-                
-                target_coll = collections[lod]
-                
+
+                # Trailing number of the DTS name = detail size ("jammer 15",
+                # "submesh_head 36"); strip any Blender .00x suffix first
+                base = re.sub(r'\.\d+$', '', obj.name)
+                m = re.search(r'(\d+)$', base)
+                coll_name = 'LOD_Other'
+                if m and int(m.group(1)) in size_to_coll:
+                    coll_name = size_to_coll[int(m.group(1))]
+
+                target_coll = _get_lod_coll(coll_name)
+
                 # Unlink from ALL current collections first (this makes eye toggle work!)
                 for coll in list(obj.users_collection):
                     coll.objects.unlink(obj)
-                
+
                 # Link to LOD collection
                 target_coll.objects.link(obj)
-                moved_counts[lod] += 1
+                moved_counts[coll_name] = moved_counts.get(coll_name, 0) + 1
 
-            
-            print(f"LOD Organization: High={moved_counts['36']}, Medium={moved_counts['10']}, Low={moved_counts['2']}, Other={moved_counts['other']}")
+            # NOTE: deliberately NOT auto-hiding the lower LOD collections.
+            # Hidden objects can't be selected, which silently breaks
+            # select-all round-trip exports (only the visible LOD gets
+            # exported and the header splice bails). Use the outliner eye
+            # icons to hide LODs manually while editing.
+            print("LOD Organization:", moved_counts)
                     
         return {'FINISHED'}

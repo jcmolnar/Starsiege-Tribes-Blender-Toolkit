@@ -38,8 +38,29 @@ Developed against Blender 3.0+ (current work is on 5.0).
   (decoded with each frame's own scale/origin) with their playback keyframed on
   the timeline; survives edit + re-export (Sensor Jammer, bows, monsters,
   vehicle flames)
-- Textures (auto-applied when image files sit next to the `.dts`)
-- IFL sequences (animated materials)
+- **Visibility tracks** — e.g. muzzle flashes: hidden by default (object flag
+  `0x1`), keyed visible at the correct fraction of the `fire` sequence
+  (per-keyframe `position` + visible bit `0x8000`), exactly as the engine
+  plays them; morph keys use the same position-accurate placement
+- **Fully automatic textures — no manual extraction needed**:
+  - loose `.png`/`.bmp` next to the `.dts` used first
+  - Dynamix **PBMP** bitmaps decoded natively
+  - missing textures pulled straight out of the game's `.vol` archives,
+    auto-located by walking up from the `.dts` to the Tribes install
+- **Fully automatic palettes**: the **PL98 multi-palette** is read directly
+  from `*World.vol` (lushWorld preferred; drop a `.ppl` next to the `.dts` to
+  force another world's tint). Each texture selects its own table via its
+  `PiDX` id, so hulls, engine flames, and translucents all get correct colors;
+  pure magenta is keyed transparent
+- **Translucent/additive materials** (muzzle flashes, flames) approximate the
+  engine's additive blending: luminance-driven alpha + emission (view in
+  Material Preview / Rendered shading)
+- IFL sequences (animated materials), keyframed in sync with their sequence
+- "Organize by LOD" collections use the shape's **actual detail sizes**
+  (36/10/2 characters, 15/4/1 deployables, ...); bounds/collision meshes
+  import as wireframe so they don't cover the model
+- Re-import into the same scene works (stale-name collisions and the global
+  frame counter are handled); the playback range extends to cover all sequences
 - Armors with bones, and vehicles
 
 ### Export
@@ -52,6 +73,9 @@ Developed against Blender 3.0+ (current work is on 5.0).
 - **Vertex-morph (shape-key) animation** — bake any source animation into per-frame
   shape keys and export a `CelAnimMesh` frame-track; used to give weapons their own
   swing/attack animation
+- Hidden DTS members (e.g. default-hidden muzzle-flash meshes) are pulled back
+  into "Selected Only" exports automatically — a select-all can't grab hidden
+  objects, which used to silently drop them from round-trips
 
 ### Animation pipeline (`tools/`)
 A headless workflow for getting new character animations into the game:
@@ -81,6 +105,9 @@ A headless workflow for getting new character animations into the game:
 - **`patch_node.py`** — move/rotate a node's default transform directly in the
   DTS binary (mount-point fixes that a Blender round-trip can't persist,
   because the hybrid splice preserves the original header).
+- **`vol_tool.py`** (repo root) — standalone PVOL archive tool: `find`/`extract`
+  any file from a `.vol`, plus `extract_pl98` to carve a world's PL98
+  multi-palette out to a `.ppl`.
 
 See [`tools/README.md`](tools/README.md) for exact command lines.
 
@@ -127,8 +154,20 @@ Useful docs:
 - **Textures:** weapon/shield skins are 8-bit MS-BMP indexed to a world multipalette
   (`bfReserved2` = paletteIndex); the orb accessory shape needs native **PBMP**.
 - Animated UVs are not supported.
-- Import one model per scene — importing several at once can break the hierarchy
-  and overlap timeline markers.
+- Re-importing into a used scene works, but timeline markers from earlier
+  imports stick around (they belong to the scene) — one model per scene is
+  still the cleanest workflow.
+- Node transform keys currently get Blender's default (bezier) interpolation;
+  morph and visibility keys are stepped like the engine.
+
+### Notes on animation playback
+- The Blender timeline is a **filmstrip of the model's sequences in file
+  order**. The in-game order (e.g. chaingun: activation → spin → fire) is
+  decided by the engine's weapon state machine in script (`item.cs`), not by
+  the model — use the timeline markers to scrub individual sequences.
+- Sequences that don't animate a node leave it wherever the previous state put
+  it, matching the engine (e.g. the Sensor Jammer stays deployed during its
+  `power` sequence).
 
 ## Wishlist
 - Bone-based animation (auto-create bones, actions instead of markers)
