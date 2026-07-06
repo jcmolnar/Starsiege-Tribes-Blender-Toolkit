@@ -1089,6 +1089,22 @@ def collect_objects_with_parents(context, use_selected=True):
         if obj.parent and obj.parent.type in ('MESH', 'EMPTY'):
             to_process.append(obj.parent)
             
+    # Hidden DTS members can't be selected in the viewport (e.g. "hide muzzle"
+    # flash meshes that a visibility track keeps hidden outside "fire"), so a
+    # select-all export would silently drop them. Pull in hidden objects that
+    # were imported as part of the model (dts_object_index) when their parent
+    # made it into the selection.
+    if use_selected:
+        for obj in context.scene.objects:
+            if obj in collected or obj.type not in ('MESH', 'EMPTY'):
+                continue
+            if 'dts_object_index' not in obj.keys():
+                continue
+            if not (obj.hide_viewport or obj.hide_render):
+                continue
+            if obj.parent is not None and obj.parent in collected:
+                collected.add(obj)
+
     # Functional Node Auto-Collection:
     # Always include nodes that are likely required by the engine (muzzle, tag, eye, etc.)
     # even if not selected, as long as they are related to children of collected nodes
