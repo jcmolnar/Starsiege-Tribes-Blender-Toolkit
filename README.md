@@ -1,8 +1,9 @@
-# Starsiege: Tribes DTS — Blender Import & Export Plugin
+# Starsiege: Tribes — Blender Import/Export Toolkit (DTS · DIS · VOL · OBJ)
 
-Import **and export** Starsiege: Tribes / Darkstar `.DTS` models in Blender, plus a
-scripted pipeline for retargeting **Mixamo** animations onto Tribes characters and
-injecting them back into game-ready DTS files.
+Import **and export** Starsiege: Tribes / Darkstar `.DTS` models and `.DIS`
+interiors (with their PVOL `.vol` archives) in Blender, plus a scripted pipeline
+for retargeting **Mixamo** animations onto Tribes characters and injecting them
+back into game-ready DTS files.
 
 This is a fork of the original import-only *TribesToBlender* addon, extended with a
 DTS **exporter**, character animation tooling, and a round-trip regression test.

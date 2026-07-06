@@ -23,15 +23,15 @@
 #################################################
 
 bl_info = {
-    "name" : "Tribes DTS Format",
+    "name" : "Tribes DTS/DIS Format",
     "author" : "Noxwizard, Krogoth, and Contributors",
-    "description" : "Import and Export Starsiege: Tribes DTS files.",
+    "description" : "Import and Export Starsiege: Tribes DTS models and DIS interiors.",
     "blender" : (3, 0, 0),
     "version" : (1, 0, 1),
     "location" : "File > Import-Export",
     "warning" : "",
-    "wiki_url" : "https://github.com/tekrog/TribesToBlender",
-    "tracker_url" : "https://github.com/tekrog/TribesToBlender/issues",
+    "wiki_url" : "https://github.com/jcmolnar/Starsiege-Tribes-DTS-DIS-VOL-OBJ-Blender-Import-Export-Plugin-Toolkit",
+    "tracker_url" : "https://github.com/jcmolnar/Starsiege-Tribes-DTS-DIS-VOL-OBJ-Blender-Import-Export-Plugin-Toolkit/issues",
     "category" : "Import-Export"
 }
 
