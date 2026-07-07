@@ -30,8 +30,8 @@ bl_info = {
     "version" : (1, 0, 1),
     "location" : "File > Import-Export",
     "warning" : "",
-    "wiki_url" : "https://github.com/jcmolnar/Starsiege-Tribes-DTS-DIS-VOL-OBJ-Blender-Import-Export-Plugin-Toolkit",
-    "tracker_url" : "https://github.com/jcmolnar/Starsiege-Tribes-DTS-DIS-VOL-OBJ-Blender-Import-Export-Plugin-Toolkit/issues",
+    "wiki_url" : "https://github.com/jcmolnar/Starsiege-Tribes-Blender-Toolkit",
+    "tracker_url" : "https://github.com/jcmolnar/Starsiege-Tribes-Blender-Toolkit/issues",
     "category" : "Import-Export"
 }
 
