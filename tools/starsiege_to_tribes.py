@@ -135,29 +135,58 @@ def write_bmp24(path, width, height, indices, palette):
         f.write(fh + ih + pixels)
 
 
+def write_png(path, width, height, indices, palette):
+    """Write a truecolor PNG by resolving PBMP indices through the palette.
+
+    The native client prefers a .png sibling of a material's .bmp
+    (ts_material.cpp: altExts = {".png",".gif",".tga"}, gated on
+    $pref::pngTextures, default on) and its PNG path does NOT palette-remap the
+    way the 8-bit .bmp path does -- so baking the Starsiege colors into a PNG
+    gives correct colors in-game. PBMP data is top-down, which is also PNG's
+    row order, so no flip.
+    """
+    from PIL import Image
+    img = Image.new('RGB', (width, height))
+    px = img.load()
+    for y in range(height):
+        base = y * width
+        for x in range(width):
+            idx = indices[base + x]
+            px[x, y] = palette[idx] if idx < len(palette) else (0, 0, 0)
+    img.save(path, 'PNG')
+
+
 def convert_texture(name, games, ppl_tables, outdir):
-    """Pull a Herc skin out of the archives and bake it to a Tribes BMP."""
+    """Pull a Herc skin out of the archives and emit a Tribes-loadable texture.
+
+    Emits BOTH a truecolor .png (preferred by the native client, correct
+    colors) and a 24-bit .bmp fallback (used if $pref::pngTextures is off).
+    Returns (list_of_output_paths, note).
+    """
     raw, src = games.find(name)
     if raw is None:
-        return None, 'not found in any .vol'
+        return [], 'not found in any .vol'
+    base = os.path.splitext(name)[0]
     if raw[:4] != b'PBMP':
         # already an ordinary bitmap -- copy through untouched
         out = os.path.join(outdir, name)
         with open(out, 'wb') as f:
             f.write(raw)
-        return out, 'copied (not PBMP)'
+        return [out], 'copied (not PBMP)'
     try:
         w, h, indices, pidx, embedded = parse_pbmp(raw)
     except Exception as e:
-        return None, 'PBMP parse failed: %s' % e
+        return [], 'PBMP parse failed: %s' % e
     palette = embedded
     if palette is None and ppl_tables:
         palette = ppl_tables.get(pidx) or ppl_tables.get(None)
     if palette is None:
-        return None, 'no palette (PiDX=%s)' % pidx
-    out = os.path.join(outdir, name)
-    write_bmp24(out, w, h, indices, palette)
-    return out, '%dx%d 24-bit from %s' % (w, h, os.path.basename(src))
+        return [], 'no palette (PiDX=%s)' % pidx
+    png_out = os.path.join(outdir, base + '.png')
+    bmp_out = os.path.join(outdir, name)
+    write_png(png_out, w, h, indices, palette)
+    write_bmp24(bmp_out, w, h, indices, palette)
+    return [png_out, bmp_out], '%dx%d png+bmp from %s' % (w, h, os.path.basename(src))
 
 
 # ---------------------------------------------------------------- sequences
@@ -603,9 +632,11 @@ def main():
             wanted.append(mf)
     if not wanted:
         print('    (none -- all materials are flat colours)')
+    tex_files = []
     for mf in wanted:
-        out, note = convert_texture(mf, games, ppl_tables, args.outdir)
-        print('    %-18s %s' % (mf, note if out else 'SKIPPED: ' + note))
+        outs, note = convert_texture(mf, games, ppl_tables, args.outdir)
+        print('    %-18s %s' % (mf, note if outs else 'SKIPPED: ' + note))
+        tex_files.extend(outs)
 
     # --- sequences -----------------------------------------------------
     print('\n  sequence renames:')
@@ -653,11 +684,7 @@ def main():
     emit_playerdata(shapename, dbname, sh.radius, cs_out, applied, box=box)
     print('  wrote %s  (PlayerData %s)' % (cs_out, dbname))
 
-    produced = [dts_out, cs_out]
-    for mf in wanted:
-        p = os.path.join(args.outdir, mf)
-        if os.path.exists(p):
-            produced.append(p)
+    produced = [dts_out, cs_out] + [p for p in tex_files if os.path.exists(p)]
 
     if args.install:
         install(args.install, produced, dbname)
