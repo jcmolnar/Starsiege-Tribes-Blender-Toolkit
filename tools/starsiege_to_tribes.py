@@ -332,12 +332,22 @@ def emit_playerdata(shapename, dbname, sh_radius, outpath, renamed):
     lines.append('')
     lines.append('')
     lines.append('//--- wear it -----------------------------------------------------------')
-    lines.append('// On a NON-DEDICATED (listen) server the console is the server console, so')
-    lines.append('// Player::setArmor can be called directly -- no need for $ServerCheats,')
-    lines.append('// which only gates the remoteSetArmor path used by remote clients.')
+    lines.append('// IMPORTANT: this datablock must be declared at SERVER STARTUP, not from')
+    lines.append('// the console. createServer() (base scripts.vol server.cs) execs the')
+    lines.append('// armor/item/etc. files and THEN calls preloadServerDataBlocks(); a')
+    lines.append('// PlayerData declared after that is never registered, so Player::setArmor')
+    lines.append('// silently reverts (verified: a console-exec\'d datablock on the stock')
+    lines.append('// larmor shape fails while startup-declared larmor works).')
     lines.append('//')
-    lines.append('//     exec("%s.cs");' % dbname.lower())
+    lines.append('// The tool\'s --install step makes a loose base\\armordata.cs (stock copy +')
+    lines.append('// exec("%s.cs")), which createServer runs before preload. After' % dbname.lower())
+    lines.append('// installing, RESTART the listen server, then:')
+    lines.append('//')
     lines.append('//     %s();' % ('be' + dbname))
+    lines.append('//')
+    lines.append('// On a listen server the console is the server console, so Player::setArmor')
+    lines.append('// works directly -- $ServerCheats only gates the remoteSetArmor path that')
+    lines.append('// remote clients use.')
     lines.append('//')
     lines.append('// Spawn in as a normal player FIRST -- there has to be a control object to')
     lines.append('// re-skin. GameBase::setDatFileName reloads the datablock and reverts to')
@@ -413,6 +423,10 @@ def main():
                     help='rename this node (prefix, e.g. "head") to '
                          'lowerback<size> so the view-pitch override pitches '
                          'the upper body')
+    ap.add_argument('--install', metavar='TRIBES_BASE', default=None,
+                    help='deploy the package into this Tribes base\\ folder AND '
+                         'hook the datablock into server startup (loose '
+                         'armordata.cs). This is what makes Player::setArmor work.')
     args = ap.parse_args()
 
     print('indexing %s ...' % args.game)
@@ -505,10 +519,109 @@ def main():
     emit_playerdata(shapename, dbname, sh.radius, cs_out, applied)
     print('  wrote %s  (PlayerData %s)' % (cs_out, dbname))
 
-    print('\nnext: copy %s\\* into your Tribes base\\ folder, then in the console:'
-          % args.outdir)
-    print('    exec("%s.cs");' % dbname.lower())
+    produced = [dts_out, cs_out]
+    for mf in wanted:
+        p = os.path.join(args.outdir, mf)
+        if os.path.exists(p):
+            produced.append(p)
+
+    if args.install:
+        install(args.install, produced, dbname)
+    else:
+        print('\nnext: --install "C:\\Dynamix\\Tribes\\base" to deploy AND hook the')
+        print('datablock into server startup, then restart the server and run:')
+        print('    be%s();' % dbname)
     return 0
+
+
+def install(base, produced, dbname):
+    """Deploy the package and hook the datablock into server startup.
+
+    A datablock is only usable if it is declared before
+    preloadServerDataBlocks() (base scripts.vol server.cs createServer()).
+    createServer execs armordata.cs in that window, and a loose file shadows
+    the vol entry, so we write a loose armordata.cs = stock content + an exec
+    of the Herc .cs. Idempotent: re-running replaces the marked block.
+    """
+    import shutil
+    base = os.path.abspath(base)
+    if not os.path.isdir(base):
+        print('\nINSTALL ERROR: %s is not a folder' % base)
+        return
+    print('\ninstalling into %s' % base)
+    for p in produced:
+        dst = os.path.join(base, os.path.basename(p))
+        shutil.copy2(p, dst)
+        print('  copied %s' % os.path.basename(p))
+
+    cs_name = dbname.lower() + '.cs'
+    MARK_BEGIN = '// >>> starsiege_to_tribes: custom armor hooks >>>'
+    MARK_END = '// <<< starsiege_to_tribes: custom armor hooks <<<'
+    hook = ('\n%s\n'
+            '// createServer() execs armordata.cs BEFORE preloadServerDataBlocks(),\n'
+            '// so a PlayerData exec\'d here registers in time for Player::setArmor.\n'
+            '// A datablock exec\'d from the console (after preload) never registers.\n'
+            '// Delete this block to revert; delete the whole loose file to fully\n'
+            '// restore the stock armordata.cs from the vol.\n'
+            'exec("%s");\n'
+            '%s\n' % (MARK_BEGIN, cs_name, MARK_END))
+
+    loose = os.path.join(base, 'armordata.cs')
+    if os.path.exists(loose):
+        cur = open(loose, 'r', errors='replace').read()
+        if MARK_BEGIN in cur:                      # already hooked -> replace block
+            head = cur.split(MARK_BEGIN)[0].rstrip('\n')
+            tail = cur.split(MARK_END, 1)[1] if MARK_END in cur else ''
+            body = head + '\n' + hook + tail.lstrip('\n')
+            src = 'existing loose armordata.cs (updated hook)'
+        else:
+            body = cur.rstrip('\n') + '\n' + hook
+            src = 'existing loose armordata.cs (appended hook)'
+    else:
+        stock = _stock_armordata(base)
+        if stock is None:
+            print('  WARNING: could not read stock armordata.cs from this game\'s')
+            print('           scripts.vol; writing a hook-only armordata.cs, which')
+            print('           would SHADOW the stock armors (larmor/marmor missing!).')
+            print('           Put the stock armordata.cs here yourself, then re-run.')
+            body = '// starsiege_to_tribes: incomplete -- stock armors missing\n' + hook
+            src = 'hook only (STOCK ARMORS MISSING)'
+        else:
+            body = stock.rstrip('\n') + '\n' + hook
+            src = 'stock armordata.cs (from vol) + hook'
+    with open(loose, 'w') as f:
+        f.write(body)
+    print('  wrote loose armordata.cs [%s]' % src)
+    print('\nDONE. Restart your listen server (host again), spawn in, then:')
+    print('    be%s();' % dbname)
+
+
+def _stock_armordata(base):
+    """The stock armordata.cs text from a *.vol in this game tree.
+
+    Scans the install folder and its parent (base\\ and the game root) for a
+    scripts.vol / backupscripts.vol that carries armordata.cs.
+    """
+    roots = [base, os.path.dirname(base)]
+    for root in roots:
+        try:
+            names = os.listdir(root)
+        except OSError:
+            continue
+        for fn in names:
+            if not fn.lower().endswith('.vol'):
+                continue
+            vp = os.path.join(root, fn)
+            try:
+                idx = read_vol_index(vp)
+            except Exception:
+                continue
+            if 'armordata.cs' in idx:
+                off, size = idx['armordata.cs']
+                with open(vp, 'rb') as f:
+                    f.seek(off)
+                    return f.read(size).decode('latin-1')
+    return None
 
 
 if __name__ == '__main__':
