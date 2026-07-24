@@ -92,6 +92,7 @@ class ShapeV7:
         self.off_xf = self.off_kf + s.num_keyframes * 12
         self.off_names = self.off_xf + s.num_transforms * XFORM_SIZE
         self.off_objects = self.off_names + s.num_names * NAME_SIZE
+        self.off_details = self.off_objects + s.num_objects * 72  # Objectv7 = 72
 
         # prove the layout arithmetic before we rewrite anything
         for i, parsed in enumerate(s.names):
@@ -203,6 +204,42 @@ class ShapeV7:
         struct.pack_into('<I', out, self.hdr + 8, len(new_subs) // SUBSEQ_SIZE)
         struct.pack_into('<I', out, 4, len(out) - 8)   # PERS payload size
         return bytes(out), removed
+
+    # ---------------------------------------------------------------
+    def force_full_lod(self):
+        """Make every render LOD draw the highest-detail mesh.
+
+        Returns (new_bytes, details_repointed). Starsiege shapes ship 5 render
+        LODs (sizes 64/32/16/8/4) whose lower levels drop meshes -- the Herc's
+        LOD3/4 have no cockpit. Tribes picks a LOD by projected size, so at a
+        distance the engine renders a cockpit-less level and the top appears to
+        vanish. Modern GPUs don't need the LOD reduction, so point every
+        positive-size detail's root node at detail 0's root: the engine renders
+        `getDetail(dl) = fNodeInstanceList[fDetails[dl].fRootNodeIndex]` and
+        recurses that subtree (ts_shapeInst.cpp:2600/669), so all LODs now draw
+        the full detail-0 mesh.
+
+        Detail SIZES are left unchanged so selectDetail still always picks a
+        level (nothing renders blank at distance) and getNodeAtCurrentDetail --
+        which builds mount-node names from int(size) -- still resolves; mount
+        nodes stay correct because Player::initResources patches each lower
+        detail's mount-node transform to detail 0's at load. Size<=0 details
+        (cam / collision) are left alone.
+        """
+        buf = self.buf
+        s = self.sh
+        details = s.details
+        if not details:
+            return buf, 0
+        DET_SIZE = 8               # Detail: root_node_index u4, size f4
+        root0 = details[0].root_node_index
+        out = bytearray(buf)
+        repointed = 0
+        for d, det in enumerate(details):
+            if det.size > 0 and det.root_node_index != root0:
+                struct.pack_into('<I', out, self.off_details + d * DET_SIZE, root0)
+                repointed += 1
+        return bytes(out), repointed
 
     # ---------------------------------------------------------------
     def build(self, new_nodes, renames=None):

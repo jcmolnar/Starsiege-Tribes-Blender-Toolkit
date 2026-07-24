@@ -562,6 +562,9 @@ def main():
                     help='PlayerData name (default: derived from the shape)')
     ap.add_argument('--list', action='store_true',
                     help='list Herc-like shapes and exit')
+    ap.add_argument('--keep-lods', action='store_true',
+                    help='keep the reduced lower LODs (default: draw full '
+                         'detail at every LOD so the top never culls at range)')
     ap.add_argument('--no-nodes', action='store_true',
                     help='skip injecting the Tribes player utility nodes')
     ap.add_argument('--pitch-node', default=None,
@@ -674,6 +677,14 @@ def main():
     patched, n_stripped = sv.strip_sequence_tracks('looks')
     print('\n  looks-sequence: stripped %d node tracks (was clamping the body)'
           % n_stripped)
+
+    # Draw full detail at every LOD (modern GPUs don't need the reduction, and
+    # the Herc's lower LODs drop the cockpit -> "see-through top" at distance).
+    if not args.keep_lods:
+        sv = ipn.ShapeV7(patched)
+        patched, n_lod = sv.force_full_lod()
+        print('  full-LOD: repointed %d detail levels to detail 0 (no more '
+              'cockpit-drop at distance)' % n_lod)
 
     dts_out = os.path.join(args.outdir, shapename + '.dts')
     with open(dts_out, 'wb') as f:
