@@ -120,24 +120,28 @@ class ShapeV7:
         return None
 
     def strip_sequence_tracks(self, seq_name):
-        """Detach a sequence's transform tracks from every NODE, in place.
+        """Remove a sequence's transform tracks from every NODE.
 
-        Returns (new_bytes, tracks_detached). The sequence itself stays (the
+        Returns (new_bytes, tracks_removed). The sequence itself stays (the
         engine AssertFatal's if "looks" is missing, player.cpp:385) but no node
-        is owned by a thread playing it. Needed because Tribes plays the "looks"
-        aim sequence on a high-priority viewThread; Ts3 assigns each node to the
-        highest-priority thread that has a track for it, so a Herc's
-        full-skeleton "looks" clamps the whole body and the run cycle plays
-        invisibly underneath (diagnosed in-engine). Detaching "looks" hands
-        every node back to the movement thread.
+        subscribes to it. Needed because Tribes plays the "looks" aim sequence
+        on a high-priority viewThread; `UpdateSequenceSubscriberLists`
+        (ts_shapeInst.cpp:2726) registers each node under every sequence its
+        subsequences name, and Ts3 then gives the node to the highest-priority
+        subscribed thread. A Herc's full-skeleton "looks" subscribes all 48
+        nodes, so viewThread clamps the whole body and the run cycle plays
+        invisibly underneath. Removing "looks" from the node blocks hands every
+        node back to the movement thread.
 
-        Done by rewriting the `sequence_index` field of each NODE-referenced
-        "looks" subsequence to an unused index (`num_seq`), which no thread ever
-        plays (current sequence is always in [0, num_seq)). This changes NO
-        array sizes and NO other references: the subsequence array is SHARED
-        with objects (mesh frame-track / visibility animation), so removing or
-        reindexing entries would corrupt object tracks. Object subsequences and
-        all keyframes are left untouched.
+        Implemented as an array rebuild, because the subsequence array is SHARED
+        with OBJECTS (mesh frame-track / visibility animation): objects index it
+        via their own first_subsequence/num_subsequences. So we rebuild the
+        array as (each node's filtered block) ++ (each object's full block) and
+        repoint BOTH node and object records. Every surviving subsequence keeps
+        its (sequence_index, num_keyframes, first_keyframe) intact -- keyframes
+        and transforms are untouched -- so all indices stay valid, and
+        sequence_index never goes out of [0, num_seq) (an earlier relabel-to-
+        num_seq crashed in UpdateSequenceSubscriberLists' OOB list index).
         """
         buf = self.buf
         s = self.sh
@@ -148,19 +152,52 @@ class ShapeV7:
             return buf, 0
 
         SUBSEQ_SIZE = 12
-        unused = s.num_seq                 # never equals any played sequence
+        OBJ_SIZE = 72          # Objectv7: name/flags/mesh/node/tmat3f + nSub/firstSub
+        OBJ_NSUB_OFF = 64      # num_subsequences within an object record
         subs = s.subsequences_v7
-        out = bytearray(buf)
-        detached = 0
-        for n in self.nodes:               # NODE blocks only -- not objects
-            first = n.first_subsequence
+        objects = s.objects_v7 if getattr(s, 'objects_v7', None) else s.objects
+
+        new_subs = bytearray()
+        node_bytes = bytearray(buf[self.off_nodes:self.off_seq])
+        removed = 0
+
+        for i, n in enumerate(self.nodes):
+            new_first = len(new_subs) // SUBSEQ_SIZE
+            kept = 0
             for k in range(n.num_subsequences):
-                si = first + k
-                if subs[si].sequence_index == seq_idx:
-                    struct.pack_into('<I', out, self.off_subseq + si * SUBSEQ_SIZE,
-                                     unused)
-                    detached += 1
-        return bytes(out), detached
+                ss = subs[n.first_subsequence + k]
+                if ss.sequence_index == seq_idx:
+                    removed += 1
+                    continue
+                new_subs += struct.pack('<III', ss.sequence_index,
+                                        ss.num_keyframes, ss.first_keyframe)
+                kept += 1
+            struct.pack_into('<II', node_bytes, i * NODE_SIZE + 8, kept, new_first)
+
+        # objects keep ALL their subsequences (they carry frame-track/visibility
+        # tracks); just relocate them and repoint. Objects live in the tail,
+        # after the keyframe section.
+        tail = bytearray(buf[self.off_kf:])
+        obj_rel = self.off_objects - self.off_kf
+        for j, o in enumerate(objects):
+            new_first = len(new_subs) // SUBSEQ_SIZE
+            for k in range(o.num_subsequences):
+                ss = subs[o.first_subsequence + k]
+                new_subs += struct.pack('<III', ss.sequence_index,
+                                        ss.num_keyframes, ss.first_keyframe)
+            struct.pack_into('<II', tail, obj_rel + j * OBJ_SIZE + OBJ_NSUB_OFF,
+                             o.num_subsequences, new_first)
+
+        out = bytearray()
+        out += buf[:self.off_nodes]                 # header
+        out += node_bytes                           # nodes (repointed)
+        out += buf[self.off_seq:self.off_subseq]    # sequences (unchanged)
+        out += new_subs                             # rebuilt subsequences
+        out += tail                                 # keyframes .. end (objs repointed)
+
+        struct.pack_into('<I', out, self.hdr + 8, len(new_subs) // SUBSEQ_SIZE)
+        struct.pack_into('<I', out, 4, len(out) - 8)   # PERS payload size
+        return bytes(out), removed
 
     # ---------------------------------------------------------------
     def build(self, new_nodes, renames=None):
