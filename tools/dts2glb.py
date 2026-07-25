@@ -35,47 +35,48 @@ Why this is not just "import, then export_scene.gltf":
   existing action via action_frame_start/action_frame_end, which sidesteps
   Blender 5.0's layered/slotted Action authoring API entirely.
 
-★KNOWN CEILING -- SEQUENCE COUNT vs THE Int16 KEYFRAME CAP★
+★THE Int16 KEYFRAME CAP, AND HOW IT IS MET★  (was "KNOWN CEILING" -- it is not one)
 
-  This approach is proven on tr_talon.dts (12 sequences, 48 animated nodes): every
-  check passes and it plays correctly in game.  It does NOT currently scale to a
-  shape with many sequences, and rpgmalehuman.dts (44 sequences, ~1730
-  node-sequence pairs) is past the limit.  The squeeze:
+  ts_gltf builds one TS::Shape keyframe AND one transform per sampled time, per
+  (node, sequence).  Version 8 narrowed those indices to Int16 -- fFirstKeyframe and
+  fnKeyframes are Int16 and fKeyValue is UInt16 in the LIVE in-memory struct
+  (ts_shape.h:133,190-191), not merely on disk -- so the loader caps at 32000
+  keyframes / 65000 transforms and DROPS the remainder (ts_gltf.cpp:1194-1201).
+  Blender's NLA export always BAKES (export_force_sampling=False is ignored in
+  NLA_TRACKS mode -- verified byte-identical), and a rate high enough to keep a
+  0.033s sequence alive (240 fps) produced 678,946 keyframes on rpgmalehuman.dts.
+  Sampling down instead wrecks duration fidelity (run 0.600s vs the authored
+  0.667s at the ~10 fps the budget allowed) and looks choppy on a humanoid.
 
-    * ts_gltf builds one TS::Shape keyframe AND one transform per sampled time,
-      per (node, sequence).  Version 8 narrowed those indices to Int16, so the
-      loader caps at 32000 keyframes and drops the rest.
-    * A rate high enough to keep a 0.033s sequence alive (240 fps) produces
-      678,946 keyframes -- 21x the cap.
-    * Dropping to the ~10 fps the budget allows then breaks duration fidelity
-      (run 0.600s vs the authored 0.667s) and looks choppy on a humanoid.
-    * Sparse export would fix both -- the .dts holds only 8,635 keys -- but
-      export_force_sampling=False is IGNORED in NLA_TRACKS mode (verified:
-      byte-identical output), because NLA evaluation requires baking.
+  So: bake HIGH, then remove the redundancy.  Three things get it under the cap.
 
-  Two things fixed most of it:
     * --one-lod deletes all but the highest detail.  ★A .dts SHARES one subsequence
       range across its LOD copies★ (662 records serve 1730 node-sequence pairs)
       while ts_gltf gives every node its own -- 2.6x the keyframes for geometry a
       modern client never shows.  Joe's call, and the right one.
-    * decimate_glb_animations() drops every key that interpolation already
-      reproduces, verified by reconstruction error and HARD-FAILING above 2e-3.
+    * decimate_glb_animations() drops every key the interpolation already
+      reproduces, HARD-FAILING above a 2e-3 reconstruction error.
+    * ★The decimation metric IS the reconstruction error★ (see _decimate).  Three
+      earlier attempts used a cheap PROXY for it and each one either broke poses or
+      over-kept by 3.3x.  Measured on rpgmalehuman.dts, 88,401 baked sampler keys:
 
-  ★WHAT REMAINS IS ONE BUG, NOT AN ARCHITECTURAL WALL.★ 43 sequences x 36 nodes x
-  the .dts's own 13 keys per track is ~20,000 -- comfortably under the cap.  So the
-  gap is the ROTATION metric failing to recover that density:
+          metric                        keyframes   max rotation error
+          plane only                      >cap      1.39      broken poses
+          plane + monotonic angle         >cap      1.35      broken poses
+          plane + uniform rate           83,929     1.24e-03  correct, 2.62x OVER
+          objective (shipped)            25,303     3.05e-05  correct, UNDER CAP
 
-      component-linear        8.8x   over cap
-      plane only             43.5x   error 1.39
-      plane + monotonic      43.5x   error 1.35
-      plane + uniform rate    7.7x   error 1.24e-03, 2.6x over cap  <- current
+      Smaller AND more accurate -- there was no trade.  A note here previously
+      blamed "quaternion SIGN handling" for the ~1.35 figure; ★that was WRONG★ and
+      the reasons are recorded in _decimate's docstring so nobody re-derives it.
 
-  Every loose test explodes to ~1.35 on components bounded to [-1,1] (about sqrt 2)
-  as soon as segments grow long, which looks like a quaternion SIGN-handling defect
-  rather than an inherent cost -- start there.  Blender normalises quaternions on
-  evaluation, so the baked path is nlerp: the same great-circle arc slerp takes but
-  at a non-uniform rate.  The shipped setting is deliberately the strict one: it can
-  only be too big, never wrong.
+  ★What the cap actually charges, since it is easy to measure the wrong thing.★
+  ts_gltf.cpp:1167-1192 emits one keyframe per entry in the UNION of a node's
+  translation and rotation key times for that sequence -- not one per sampler key.
+  Measured union/sampler ratio on rpgmalehuman: 0.949, because Blender shares ONE
+  input (time) accessor across every channel of an animation, so the two channels
+  already agree on times.  Decimating them independently is therefore safe; it does
+  not inflate the union.  Report the union, not the sampler total.
 """
 
 import bpy
@@ -804,132 +805,143 @@ def glb_signed_volume(js, data, bin_off):
     return total, pos_n, neg_n
 
 
-def _decimate_linear(times, vals, eps):
-    """Indices to KEEP so linear interpolation reproduces the curve within eps.
+def _fit_error_lin(times, vals, lo, hi):
+    """Worst deviation if [lo..hi] collapses to ONE linearly interpolated segment."""
+    if hi <= lo + 1:
+        return 0.0
+    span = times[hi] - times[lo]
+    ncomp = len(vals[0])
+    a, b = vals[lo], vals[hi]
+    worst = 0.0
+    for m in range(lo + 1, hi):
+        f = 0.0 if span <= 0 else (times[m] - times[lo]) / span
+        row = vals[m]
+        for c in range(ncomp):
+            e = abs(a[c] + (b[c] - a[c]) * f - row[c])
+            if e > worst:
+                worst = e
+    return worst
 
-    The source is piecewise linear -- the .dts stores sparse keys and both sides
-    now interpolate LINEARLY -- so a segment can be extended by checking only
-    whether each next sample continues the line through the segment's first two
-    points.  That is O(n) rather than the O(n^2) of re-testing every intermediate,
-    which matters at ~678k samples.  The caller VERIFIES the result by
-    reconstructing, so the assumption is checked rather than trusted."""
+
+def _fit_error_rot(times, vals, lo, hi):
+    """Worst deviation if [lo..hi] collapses to ONE slerp segment."""
+    if hi <= lo + 1:
+        return 0.0
+    span = times[hi] - times[lo]
+    a, b = vals[lo], vals[hi]
+    worst = 0.0
+    for m in range(lo + 1, hi):
+        f = 0.0 if span <= 0 else (times[m] - times[lo]) / span
+        q = _slerp(a, b, f)
+        row = vals[m]
+        e1 = max(abs(q[c] - row[c]) for c in range(4))
+        e2 = max(abs(-q[c] - row[c]) for c in range(4))
+        e = e1 if e1 < e2 else e2
+        if e > worst:
+            worst = e
+    return worst
+
+
+def _decimate(times, vals, tol, rotation):
+    """Indices to KEEP, by greedy longest-segment fit.
+
+    ★THE ACCEPTANCE TEST IS THE OBJECTIVE ITSELF.★  That is the whole point, and it
+    is what three earlier attempts got wrong.  Every previous metric was a PROXY for
+    the reconstruction error we are actually graded on -- "does the next sample
+    continue the line through the first two points" for translation, "does every
+    sample stay in the 2-plane of the first two, sweeping at a uniform rate" for
+    rotation -- and a proxy can always diverge from its objective.  Measured on
+    rpgmalehuman.dts (43 sequences, 36 nodes, 88,401 baked sampler keys):
+
+        metric                        keyframes   max rotation error
+        plane only                      >cap      1.39      <- visibly broken poses
+        plane + monotonic angle         >cap      1.35      <- visibly broken poses
+        plane + uniform rate           83,929     1.24e-03  <- correct, 2.62x OVER CAP
+        THIS (objective)               25,303     3.05e-05  <- correct AND under cap
+
+    So the objective test is simultaneously 3.3x smaller and 40x more accurate than
+    the best proxy.  Nothing was traded away.
+
+    ★Why the proxies failed, measured -- do not re-derive.★  In-plane is NECESSARY
+    but NOT SUFFICIENT (a rotation that speeds up about one axis stays in its plane
+    while being nothing like a single slerp), and worse, the plane's basis was built
+    by Gram-Schmidt from two ADJACENT samples.  Blender bakes at a high rate, so
+    adjacent quaternions are nearly identical, the orthogonal residual is a tiny
+    difference vector, and normalising it amplifies float noise into an essentially
+    arbitrary direction -- the "plane" was often not the arc's plane at all.  Only
+    the scalar uniform-rate test was actually holding correctness, and requiring a
+    UNIFORM rate is stricter than the geometry needs: Blender normalises quaternions
+    on evaluation, so the baked path is nlerp -- the same great-circle arc slerp
+    takes, but traversed at a non-uniform rate.  Cutting on rate therefore cut arcs
+    that slerp reproduces perfectly, which is exactly the 3.3x.
+
+    ★An earlier note here blamed "quaternion SIGN handling" because the loose-metric
+    error landed near sqrt(2).  That was WRONG.★  Sign is handled correctly in all
+    three places that matter: QuatF::interpolate negates q2 when cosOmega < 0
+    (m_quat.cpp:259-265), _slerp below does the same, and the error metric compares
+    both +q and -q.  ~1.35 is simply the scale of the deviation between unrelated
+    unit quaternions -- the signature of a segment extended far past where it should
+    have been cut, not of a sign bug.
+
+    Schedule: from each kept key, exponentially probe outward while the segment still
+    fits, then binary-search the boundary between the last good end and the first bad
+    one.  A segment of length L costs O(L log L) instead of the O(L^2) of testing
+    every candidate end.
+
+    ★Monotonicity caveat, deliberately accepted.★  "[lo..hi] fits" is not strictly
+    monotone in hi, so the binary search can stop at a shorter segment than the true
+    maximum.  That direction is safe -- it keeps an EXTRA key and never exceeds tol --
+    and the caller re-verifies the whole result with _reconstruct_error against every
+    original sample, so correctness never rests on this assumption.
+    """
     n = len(times)
     if n <= 2:
         return list(range(n))
-    ncomp = len(vals[0])
+    fit = _fit_error_rot if rotation else _fit_error_lin
     keep = [0]
-    i = 0
-    while i < n - 1:
-        j = i + 1
-        if j >= n - 1:
-            break
-        dt = times[j] - times[i]
-        k = j + 1
-        while k < n:
-            if dt == 0.0:
+    lo = 0
+    while lo < n - 1:
+        step = 1
+        good = lo + 1
+        while True:
+            cand = lo + step * 2
+            if cand >= n - 1:
+                if fit(times, vals, lo, n - 1) <= tol:
+                    good = n - 1
                 break
-            span = times[k] - times[i]
-            ok = True
-            for c in range(ncomp):
-                pred = vals[i][c] + (vals[j][c] - vals[i][c]) * (span / dt)
-                if abs(pred - vals[k][c]) > eps:
-                    ok = False
-                    break
-            if not ok:
+            if fit(times, vals, lo, cand) <= tol:
+                good = cand
+                step *= 2
+            else:
                 break
-            k += 1
-        keep.append(k - 1)
-        i = k - 1
+        if good < n - 1:
+            a, b = good, min(lo + step * 2, n - 1)
+            while b - a > 1:
+                mid = (a + b) // 2
+                if fit(times, vals, lo, mid) <= tol:
+                    a = mid
+                else:
+                    b = mid
+            good = a
+        if good <= lo:
+            good = lo + 1
+        keep.append(good)
+        lo = good
     if keep[-1] != n - 1:
         keep.append(n - 1)
     return keep
 
 
-# How far the swept angle may drift from proportional-to-time before a slerp
-# segment is cut.  1e-3 rad let the reconstruction reach 5.8e-3 on components
-# bounded to [-1,1] (~0.66 degrees) -- measurable on a limb, and over the error
-# budget.  Tightened once collapsing LODs freed up keyframe headroom.
-ANG_TOL = 1.0e-4
-
-
-def _quat_angle(a, b):
-    d = abs(sum(a[c] * b[c] for c in range(4)))
-    return 2.0 * math.acos(max(-1.0, min(1.0, d)))
-
-
-def _decimate_slerp(times, vals, tol):
-    """Indices to keep for a ROTATION channel.
-
-    ★glTF LINEAR on quaternions is SPHERICAL, not component-linear★ (spec 3.6.2.3;
-    ts_gltf.cpp:1176 slerps with the engine's own QuatF::interpolate).  So a baked
-    slerp arc cannot be thinned by a straight-line test -- its samples sit off the
-    chord by design, and measuring against the chord kept 123 keys per track where
-    the .dts holds 13.  That single wrong metric was the whole reason component-wise
-    decimation only reached 8.8x instead of the ~78x available.
-
-    A slerp arc lies in the 2-plane spanned by its endpoints, so extend a segment
-    while every sample stays in the plane of its first two.  O(n), and the caller
-    verifies the result by reconstructing with real slerp."""
-    n = len(vals)
-    if n <= 2:
-        return list(range(n))
-    keep = [0]
-    i = 0
-    while i < n - 1:
-        j = i + 1
-        if j >= n - 1:
-            break
-        a = vals[i]
-        na = math.sqrt(sum(x * x for x in a)) or 1.0
-        an = [x / na for x in a]
-        b = vals[j]
-        d = sum(an[c] * b[c] for c in range(4))
-        r = [b[c] - an[c] * d for c in range(4)]
-        nr = math.sqrt(sum(x * x for x in r))
-        k = j + 1
-        if nr < 1e-9:
-            # second key is parallel to the first: constant pose, extend while equal
-            while k < n and max(abs(vals[k][c] - a[c]) for c in range(4)) <= tol:
-                k += 1
-        else:
-            bn = [x / nr for x in r]
-            # In-plane is NECESSARY but NOT SUFFICIENT: a rotation that speeds up or
-            # slows down about one axis stays in its plane while being nothing like a
-            # single uniform slerp.  Trusting the plane test alone gave a max
-            # reconstruction error of 1.39 on components bounded to [-1,1] -- visibly
-            # broken poses that still passed the keyframe cap.  So also require the
-            # swept angle to grow in proportion to time, which is what makes the arc
-            # a single slerp segment.
-            step_ang = _quat_angle(a, b)
-            step_dt = times[j] - times[i]
-            while k < n:
-                q = vals[k]
-                ca = sum(q[c] * an[c] for c in range(4))
-                cb = sum(q[c] * bn[c] for c in range(4))
-                off = max(abs(q[c] - (an[c] * ca + bn[c] * cb)) for c in range(4))
-                if off > tol:
-                    break
-                # Blender NORMALISES quaternions when it evaluates, so the baked
-                # path is nlerp: the same great-circle arc slerp takes, but at a
-                # non-uniform rate.  Requiring a UNIFORM rate is stricter than the
-                # geometry needs and costs keys -- but every looser test tried so
-                # far (plane only; plane + monotonic angle) let the reconstruction
-                # blow up to ~1.35 on components bounded to [-1,1], i.e. visibly
-                # wrong poses.  Until that is understood, take the strict test:
-                # correctness first, size second.
-                if step_dt > 0.0:
-                    want = step_ang * ((times[k] - times[i]) / step_dt)
-                    if abs(_quat_angle(a, q) - want) > ANG_TOL:
-                        break
-                k += 1
-        keep.append(k - 1)
-        i = k - 1
-    if keep[-1] != n - 1:
-        keep.append(n - 1)
-    return keep
+def _qnorm(q):
+    n = math.sqrt(sum(x * x for x in q)) or 1.0
+    return [x / n for x in q]
 
 
 def _slerp(a, b, t):
+    # ★Shortest arc.★  Negating q2 on a negative dot is not an optimisation, it is
+    # required for parity: QuatF::interpolate does exactly this (m_quat.cpp:259-265),
+    # so a metric that did NOT flip would be measuring a different curve than the one
+    # the engine will play back.
     d = sum(a[c] * b[c] for c in range(4))
     if d < 0.0:
         b = [-x for x in b]
@@ -1065,9 +1077,14 @@ def decimate_glb_animations(path):
             times = [t[0] for t in ts]
             is_rot = (accs[ao]['type'] == 'VEC4' and rot_sampler.get(id(s), False))
             if is_rot:
-                keep = _decimate_slerp(times, vs, EPS_ROT)
-            else:
-                keep = _decimate_linear(times, vs, EPS_LIN)
+                # Normalise before fitting: _slerp renormalises its result, so
+                # comparing it against a non-unit sample would charge the fit for the
+                # length difference rather than the pose difference.  glTF requires
+                # rotation quaternions to be unit anyway (spec 3.7.3.2 / 5.24), and
+                # ts_gltf hands them straight to QuatF::interpolate, so writing the
+                # normalised values back is both safe and more correct.
+                vs = [tuple(_qnorm(v)) for v in vs]
+            keep = _decimate(times, vs, EPS_ROT if is_rot else EPS_LIN, is_rot)
             before += len(times)
             after += len(keep)
             if len(keep) < len(times):
