@@ -40,6 +40,7 @@ import bpy
 import sys
 import os
 import json
+import math
 import struct
 import traceback
 
@@ -204,10 +205,22 @@ def dts_sequence_owner_counts(path):
             for k in range(firstsub, firstsub + nsub):
                 if 0 <= k < nSubSeq:
                     counts[subs[k][0]] += 1
+
+        # fDuration is the 3rd field of a Sequence: fName, fCyclic, fDuration,
+        # fPriority, fFirstFrameTrigger, fNumFrameTriggers, fNumIFLSubSequences,
+        # fFirstIFLSubSequence (ts_shape.h:167-184) -- 8 x 4 bytes at v7, which is
+        # exactly the 32-byte stride solved for above.
+        durations = [0.0] * nSeq
+        for s in range(nSeq):
+            try:
+                durations[s] = struct.unpack_from("<f", data, seq_off + s * best + 8)[0]
+            except Exception:
+                durations[s] = 0.0
+
         log("DTS v{}: {} node(s), {} sequence(s), sequence stride {} bytes "
             "(subsequence table validates for all {} records)".format(
                 version, nNodes, nSeq, best, nSubSeq))
-        return counts
+        return counts, durations
     except Exception as e:
         log("  !! could not read sequence ownership from the .dts: {}".format(e))
         return None
@@ -222,7 +235,35 @@ def has_keys_in(act, fs, fe):
     return False
 
 
-def build_nla_tracks(ranges, owner_counts):
+def retime_strip(strip, fs, fe, dts_dur, fps):
+    """Place the strip at scene frame 0 and stretch it to the DTS's AUTHORED
+    duration.
+
+    Two separate corrections, both measured:
+      * 0-basing -- the exporter bakes over the strip's SCENE range, and
+        ts_gltf.cpp takes fDuration from the sampler's MAX time (not its span),
+        normalising keys as time/duration.  A strip left where it was imported
+        exported 'sprint' as 4.917..5.708s, so 86% of the cycle was a frozen
+        first pose followed by a blip.
+      * retiming -- the DTS importer lays sequences out by KEYFRAME COUNT, which
+        throws the authored duration away.  Measured against tr_talon.dts:
+        run 2.667s -> 1.792s (49% too fast), root 0.067s -> 0.167s (2.5x too
+        slow).  The ratios are not a constant, so this is not an fps mismatch and
+        cannot be fixed by changing the scene rate."""
+    action_len = float(fe - fs)
+    strip.action_frame_start = float(fs)
+    strip.action_frame_end = float(fe)
+    strip.frame_start = 0.0
+    strip.frame_end = action_len
+    if dts_dur and dts_dur > 0.0 and action_len > 0.0:
+        target = dts_dur * float(fps)
+        if target >= 1.0:
+            strip.scale = target / action_len
+            strip.frame_end = target
+    return strip
+
+
+def build_nla_tracks(ranges, owner_counts, durations, fps):
     """One NLA track per sequence, per animated object, each strip referencing
     that sequence's sub-range of the object's single imported action.
 
@@ -265,7 +306,7 @@ def build_nla_tracks(ranges, owner_counts):
         act = ad.action
         animated += 1
 
-        for name, fs, fe in ranges:
+        for si, (name, fs, fe) in enumerate(ranges):
             if name in skip:
                 continue          # faithful: this sequence owns no nodes
             if not has_keys_in(act, fs, fe):
@@ -278,13 +319,9 @@ def build_nla_tracks(ranges, owner_counts):
                 log("  !! strip '{}' on '{}' failed: {}".format(name, obj.name, e))
                 continue
             per_seq[name] += 1
-            # Point the strip at this sequence's slice of the action.  Order
-            # matters: widen the action range before pinning the strip range, or
-            # Blender clamps one against the other.
-            strip.frame_start = float(fs)
-            strip.frame_end = float(fe)
-            strip.action_frame_start = float(fs)
-            strip.action_frame_end = float(fe)
+            retime_strip(strip, fs, fe,
+                         durations[si] if durations and si < len(durations) else 0.0,
+                         fps)
             strip.extrapolation = 'HOLD'
             strip.blend_type = 'REPLACE'
             strip.use_animated_influence = False
@@ -315,7 +352,8 @@ def build_nla_tracks(ranges, owner_counts):
                  and o.animation_data and o.animation_data.nla_tracks is not None]
         hosts.sort(key=inert_rank)
         for name in orphans:
-            fs, fe = [(s, e) for n, s, e in ranges if n == name][0]
+            si = [i for i, (n, _, _) in enumerate(ranges) if n == name][0]
+            fs, fe = ranges[si][1], ranges[si][2]
             placed = False
             for host in hosts:
                 act = next((s.action for t in host.animation_data.nla_tracks
@@ -324,17 +362,16 @@ def build_nla_tracks(ranges, owner_counts):
                     continue
                 track = host.animation_data.nla_tracks.new()
                 track.name = name
-                strip = track.strips.new(name, int(fs), act)
-                strip.frame_start = float(fs)
-                strip.frame_end = float(fe)
+                strip = track.strips.new(name, 0, act)
                 # Keep the real 2-frame range.  Collapsing it to a single instant
                 # was tried and BACKFIRED: a zero-length action range yields no
                 # sampled channels, Blender drops the animation, and the sequence
                 # NAME disappears -- which is the condition that crashed the client.
                 # The pose is constant anyway: the importer keys this node's held
                 # transform at both ends of a range the .dts gives it no track in.
-                strip.action_frame_start = float(fs)
-                strip.action_frame_end = float(fe)
+                retime_strip(strip, fs, fe,
+                             durations[si] if durations and si < len(durations) else 0.0,
+                             fps)
                 per_seq[name] = 1
                 placed = True
                 log("  '{}' owns no nodes in the DTS -- parked on inert leaf '{}' "
@@ -494,12 +531,32 @@ def main():
         log("!! which the engine cannot bind (see this file's header). Aborting.")
         return 6
 
-    owner_counts = dts_sequence_owner_counts(src)
-    if owner_counts is None:
-        log("  !! sequence ownership unreadable -- every node will own every sequence,")
-        log("  !! which lets the view thread ('looks') pin nodes the walk should drive.")
-    build_nla_tracks(ranges, owner_counts)
+    parsed = dts_sequence_owner_counts(src)
+    if parsed is None:
+        log("  !! sequence table unreadable -- every node will own every sequence,")
+        log("  !! which lets the view thread ('looks') pin nodes the walk should drive,")
+        log("  !! and clip durations will come from frame counts rather than the .dts.")
+        owner_counts, durations = None, None
+    else:
+        owner_counts, durations = parsed
+    # Pick a sampling rate that gives even the SHORTEST sequence real frames.
+    # Retiming to the .dts duration at Blender's default 24 fps collapsed the
+    # 0.067s sequences (root / crouch root / fall) to 1.6 frames, and Blender
+    # exported nothing for them -- the clip, and its NAME, vanished.  glTF stores
+    # times in SECONDS, so a higher rate costs samples, not correctness.
+    real = [d for d in (durations or []) if d and d > 0.0]
+    fps = 24.0
+    if real:
+        fps = min(240.0, max(24.0, math.ceil(8.0 / min(real))))
+    bpy.context.scene.render.fps = int(fps)
+    bpy.context.scene.render.fps_base = 1.0
+    log("sampling at {} fps (shortest sequence {:.3f}s -> {:.0f} frames)".format(
+        int(fps), min(real) if real else 0.0, (min(real) if real else 0) * fps))
+    build_nla_tracks(ranges, owner_counts, durations, fps)
     flip_winding_to_gltf_ccw()
+    # Strips now start at frame 0, and the exporter bakes each track over its own
+    # strip range -- so the scene range has to include 0 or the first key is cut.
+    bpy.context.scene.frame_start = 0
 
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     try:
@@ -535,6 +592,38 @@ def main():
     log("  nodes      : {}".format(len(js.get('nodes', []))))
     log("  meshes     : {}".format(len(js.get('meshes', []))))
     log("  ANIMATIONS : {}  {}".format(len(names or []), names))
+
+    # Every clip must START at ~0.  ts_gltf.cpp takes fDuration from the sampler's
+    # MAX time and normalises keys as time/duration, so a late-starting clip spends
+    # most of its cycle frozen on the first pose and then blips.
+    acc = js.get('accessors', [])
+    late = []
+    for a in js.get('animations', []):
+        lo = None
+        for s in a.get('samplers', []):
+            mn = acc[s['input']].get('min', [None])[0]
+            if mn is not None:
+                lo = mn if lo is None else min(lo, mn)
+        hi = None
+        for s in a.get('samplers', []):
+            mx = acc[s['input']].get('max', [None])[0]
+            if mx is not None:
+                hi = mx if hi is None else max(hi, mx)
+        if lo is not None:
+            want = 0.0
+            if durations:
+                idx = [i for i, (nm, _, _) in enumerate(ranges) if nm == a.get('name')]
+                if idx and idx[0] < len(durations):
+                    want = durations[idx[0]]
+            log("    clip {:<14} {:.3f}..{:.3f}s   .dts says {:.3f}s  {}".format(
+                a.get('name'), lo, hi or 0.0, want,
+                "OK" if want <= 0 or abs((hi or 0.0) - want) < 0.05 else "SPEED MISMATCH"))
+            if lo > 0.05:
+                late.append((a.get('name'), lo))
+    if late:
+        log("!! FAIL: {} clip(s) do not start at 0 -- they will freeze then blip "
+            "in game: {}".format(len(late), late))
+        return 9
 
     vol, npos, nneg = glb_signed_volume(js, raw, bin_off)
     log("  winding    : {} CCW-outward / {} CW-outward, total signed volume {:.3f}".format(
