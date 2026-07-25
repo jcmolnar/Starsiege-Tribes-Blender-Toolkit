@@ -340,10 +340,23 @@ def dts_sequence_owner_counts(path):
                 if 0 <= k < nSubSeq:
                     counts[subs[k][0]] += 1
 
-        # fDuration is the 3rd field of a Sequence (ts_shape.h:167-184), so 8 bytes in.
+        # Sequence is fName, fCyclic, fDuration, fPriority, ... (ts_shape.h:167-184),
+        # so read all four: duration at +8, and cyclic/priority which ts_gltf currently
+        # HARDCODES to 1 and 0.  ★75.3% of authored sequences across an 823-shape corpus
+        # are NON-cyclic (2,579 of 3,424, in 356 shapes)★, and fCyclic is not cosmetic:
+        # ts_shape.cpp:166-188 makes a position past the last key WRAP toward the first
+        # one.  So forcing cyclic makes a weapon's 'fire'/'reload'/'activation' snap back
+        # to its start pose at the end, and makes the player's 'looks' -- the view-pitch
+        # sequence, authored fCyclic=0 -- wrap from full-up toward full-down at extreme
+        # pitch.  Carry the real values so the loader can stop guessing.
         durations = [0.0] * nSeq
+        cyclics = [0] * nSeq
+        priorities = [0] * nSeq
         for s in range(nSeq):
-            durations[s] = struct.unpack_from("<f", data, seq_off + s * SEQ_REC + 8)[0]
+            _nm, cyc, dur, prio = struct.unpack_from("<iifi", data, seq_off + s * SEQ_REC)
+            durations[s] = dur
+            cyclics[s] = int(cyc)
+            priorities[s] = int(prio)
 
         # The name table is what makes EXACT per-(node, sequence) gating possible;
         # counting alone forced "this sequence drives 47 of 48 nodes, keep them all",
@@ -398,7 +411,11 @@ def dts_sequence_owner_counts(path):
         log("DTS v{}: {} node(s), {} sequence(s), {} subsequence(s), {} keyframe(s), "
             "{} transform(s), {} name(s) -- all offsets computed, all indices in range"
             .format(version, nNodes, nSeq, nSubSeq, nKeyframes, nTransforms, nNames))
-        return counts, durations, owned, seq_names
+        nonc = sum(1 for c in cyclics if not c)
+        if nonc:
+            log("  {} of {} sequence(s) are authored NON-cyclic -- carried into the GLB "
+                "as extras so the loader does not force them cyclic".format(nonc, nSeq))
+        return counts, durations, owned, seq_names, cyclics, priorities
     except Exception as e:
         log("  !! could not read sequence ownership from the .dts: {}".format(e))
         return None
@@ -1004,6 +1021,91 @@ def _reconstruct_error(times, vals, keep, rotation=False):
     return worst
 
 
+def inject_sequence_extras(path, cyclic_of, prio_of):
+    """Carry the .dts's authored fCyclic / fPriority into the GLB as animation extras.
+
+    ★Why this is needed.★  ts_gltf.cpp:1113,1115 hardcodes fCyclic = 1 and
+    fPriority = 0 with the comment "cyclic-ness is not in glTF ... the slot->clip
+    binding that actually drives a character comes from animData".  The second half is
+    true; the first half is a gap, not a fact, and the consequence is not cosmetic.
+
+    fCyclic decides whether a position past the LAST key wraps toward the FIRST
+    (ts_shape.cpp:166-188).  Measured over an 823-shape corpus, 75.3% of authored
+    sequences are NON-cyclic (2,579 of 3,424, across 356 shapes) -- including every
+    weapon's 'activation' / 'fire' / 'reload' (which would snap back to the start pose
+    at the end of the swing) and the player's 'looks', the VIEW-PITCH sequence, whose
+    position is driven by where the player is aiming: forcing it cyclic wraps the pose
+    from full-up toward full-down at extreme pitch.
+
+    glTF has no cyclic field, but `extras` is arbitrary application JSON on any object
+    (spec 3.2 / 5.-- "extras": any) and cgltf already parses it into
+    cgltf_animation::extras.data (third_party/cgltf.h:3024 allocates and NUL-terminates
+    the raw substring).  So write it there and let the loader read it, defaulting to the
+    old hardcoded values when the key is absent -- which keeps every GLB produced before
+    this change loading exactly as it does today.
+
+    Done as a JSON post-pass rather than through Blender: the glTF exporter derives
+    extras from custom properties on nodes/meshes/materials, not on animations, and
+    this file already rewrites the GLB wholesale in decimate_glb_animations."""
+    if not cyclic_of and not prio_of:
+        return
+    with open(path, 'rb') as f:
+        data = f.read()
+    if data[0:4] != b'glTF':
+        log("  !! not a GLB, skipping sequence extras")
+        return
+    off = 12
+    chunks = []
+    js = None
+    while off + 8 <= len(data):
+        clen, ctype = struct.unpack_from('<I4s', data, off)
+        off += 8
+        chunk = data[off:off + clen]
+        off += clen
+        if ctype == b'JSON':
+            js = json.loads(chunk.decode('utf-8'))
+            chunks.append([ctype, None])          # placeholder, refilled below
+        else:
+            chunks.append([ctype, chunk])
+    if js is None or not js.get('animations'):
+        return
+
+    tagged = 0
+    noncyclic = 0
+    for a in js['animations']:
+        nm = a.get('name')
+        if nm is None or (nm not in cyclic_of and nm not in prio_of):
+            continue
+        ex = a.setdefault('extras', {})
+        if nm in cyclic_of:
+            ex['dtsCyclic'] = int(cyclic_of[nm])
+            if not cyclic_of[nm]:
+                noncyclic += 1
+        if nm in prio_of:
+            ex['dtsPriority'] = int(prio_of[nm])
+        tagged += 1
+
+    if not tagged:
+        log("  !! no GLB animation name matched a .dts sequence -- extras not written")
+        return
+
+    new_json = json.dumps(js, separators=(',', ':')).encode('utf-8')
+    while len(new_json) % 4:
+        new_json += b' '                          # spec: JSON chunk padded with spaces
+    out = bytearray()
+    for ctype, payload in chunks:
+        body = new_json if ctype == b'JSON' else payload
+        if ctype != b'JSON':
+            while len(body) % 4:
+                body = body + b'\x00'             # spec: BIN chunk padded with zeros
+        out += struct.pack('<I4s', len(body), ctype) + body
+    header = struct.pack('<4sII', b'glTF', 2, 12 + len(out))
+    with open(path, 'wb') as f:
+        f.write(header + bytes(out))
+    log("sequence extras: tagged {} animation(s) with authored fCyclic/fPriority "
+        "({} non-cyclic)".format(tagged, noncyclic))
+
+
 def decimate_glb_animations(path):
     """Drop every animation keyframe that linear interpolation already reproduces.
 
@@ -1291,16 +1393,19 @@ def main():
         log("  !! and clip durations will come from frame counts rather than the .dts.")
         count_of, dur_of, owned = {}, {}, None
         durations = None
+        cyclic_of, prio_of = {}, {}
     else:
-        counts, durations, owned, seq_names = parsed
+        counts, durations, owned, seq_names, cyclics, priorities = parsed
         # Key everything by sequence NAME.  Marker INDEX is not a safe key: this
         # shape has 44 sequences and 43 timeline markers, so one unmarked sequence
         # shifts every index after it.
         if seq_names:
             count_of = dict(zip(seq_names, counts))
             dur_of = dict(zip(seq_names, durations))
+            cyclic_of = dict(zip(seq_names, cyclics))
+            prio_of = dict(zip(seq_names, priorities))
         else:
-            count_of, dur_of = {}, {}
+            count_of, dur_of, cyclic_of, prio_of = {}, {}, {}, {}
     # ★Pick the sampling rate against BOTH ends of the squeeze.★
     #
     # Too low and a short sequence collapses: retiming at Blender's default 24 fps
@@ -1382,6 +1487,9 @@ def main():
         return 5
 
     decimate_glb_animations(dst)
+    # After decimation, which rewrites the whole container -- otherwise the extras
+    # would be dropped when the JSON chunk is rebuilt.
+    inject_sequence_extras(dst, cyclic_of, prio_of)
 
     names, js, raw, bin_off = glb_animation_names(dst)
     log("---- GLB ----")
