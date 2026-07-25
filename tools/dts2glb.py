@@ -64,7 +64,36 @@ def parse_args():
     return os.path.abspath(rest[0]), os.path.abspath(rest[1])
 
 
+def check_addon_freshness():
+    """★addon_enable() loads Blender's INSTALLED copy, not this repo.★
+
+    That cost a full debugging cycle: a fix to the importer's keyframe placement
+    sat in the repo while every conversion kept running the stale installed copy,
+    so the measurement said the fix had not worked when it had simply never run.
+    Same family as a stale object file -- verify, do not assume."""
+    repo = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "main.py")
+    inst = os.path.join(bpy.utils.resource_path('USER'), "scripts", "addons",
+                        ADDON_MODULE, "main.py")
+    try:
+        if not (os.path.exists(repo) and os.path.exists(inst)):
+            return
+        a = open(repo, 'rb').read()
+        b = open(inst, 'rb').read()
+        if a == b:
+            log("addon: installed copy matches the repo")
+            return
+        log("!! ADDON IS STALE -- the installed copy differs from this repo:")
+        log("!!   repo      {} bytes  {}".format(len(a), repo))
+        log("!!   installed {} bytes  {}".format(len(b), inst))
+        log("!! addon_enable() loads the INSTALLED one, so repo edits to main.py")
+        log("!! (the DTS importer) are NOT in effect.  Copy it across and re-run.")
+    except Exception as e:
+        log("addon freshness check skipped: {}".format(e))
+
+
 def enable_addon():
+    check_addon_freshness()
     try:
         bpy.ops.preferences.addon_enable(module=ADDON_MODULE)
         log("addon_enable('{}') OK".format(ADDON_MODULE))
