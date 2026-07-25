@@ -145,14 +145,54 @@ Weapons and handheld items typically do **not** use DTS FrameTriggers for fire o
 
 | Feature | Limit / Specification | Source |
 | :--- | :--- | :--- |
-| **DTS Version** | 8 (for Tribes: Starsiege) | `ts_shape.cpp` |
-| **Max Nodes** | 64 | `ts_shapeInst.h` |
+| **DTS Version** | 8 — but **v7 files load fine** via a documented upgrade path (`ts_shape.cpp:1146-1344`) | `ts_shape.cpp` |
+| ~~**Max Nodes** 64~~ **32767** | ★The 64 figure is WRONG★ — node/parent/subseq indices are `Int16` (`ts_shape.h:214-225`), and `tr_talon.dts` runs with **101** nodes | `ts_shape.h` |
 | **Max Name Length** | 24 characters (including null) | `ts_types.h` |
 | **Max Detail Levels** | No hard limit (Int32 counter) | `ts_shape.h` |
 | **Max Verts/Poly** | 64 (Clipping limit) | `ts_PointArray.cpp` |
 | **Morph Frames** | Soft limit (Performance/Memory driven) | `ts_CelAnimMesh.cpp` |
 | **Vertex Winding** | Clockwise (CW) | `MeshBuilder.cpp` |
 | **Normal Encoding** | 8-bit index into 256-entry lookup table | `ts_vertex.cpp` |
+
+---
+
+## 7b. ★Corrections — verified 2026-07-24 against engine source and measured content★
+
+Read these before trusting the sections above; each overturns something stated earlier.
+
+- ★**v7 vs v8 will silently ruin an analysis.**★ `tr_talon.dts` is a **version 7** shape while
+  `dts.py` implements **v8**. At v7 `V7Node` is 5×Int32 and `V7SubSequence` 3×Int32 where v8 packs
+  Int16s (`ts_shape.cpp:932-976`), so every vector after the node list misaligns — the parser finds
+  **zero** of the file's 69 mesh chunks. Mesh chunks are self-describing
+  (`"PERS"<size><flags>"TS::CelAnimMesh"`), so scan for that signature to parse meshes at any
+  version; for shape-level vectors, resolve the sequence stride by validating the subsequence table
+  (self-verifying). An entire wrong diagnosis was published off the v8-assuming parse.
+- ★**The winding rule is NOT absolute.**★ §2 implies every face must be CW. Measured across
+  `Entities.vol` (1,944 meshes / 30,882 stock faces), **5.3% are wound against their own vertex
+  normals** — tiny flat cards, ambiguous or legitimately double-sided. Correct only a mesh that is
+  *mostly* backwards; see `blender_addon_anomalies.md` §3.
+- **Coordinate system**: §2's "Y-up, Blender Z → DTS Y" is contradicted by `export_dts.py`, which
+  **removed** its axis-conversion option with the note that Tribes DTS is Z-up right-handed,
+  identical to Blender, "verified from engine source (Ml/Ts3)" — and that enabling conversion
+  tipped models 90°. Trust the code.
+- **`animData` field 7 is `HoldPose`, not "signalThread"** — the script comment in
+  `armordata.cs` (and every RPG/RMRPG/SWRPG copy) is wrong. Real layout:
+  `{name, soundTag, direction, FirstPerson, ChaseCam, ThirdPerson, HoldPose, priority}`
+  (`program\inc\player.h:219-233`).
+- ★**A missing clip name is invisible at runtime.**★ `animIndex[i] == -1` is coerced to `0`
+  (`player.cpp:412-413`), so the slot plays sequence 0 (idle) forever with no error. This is why
+  coverage has to be checked at EXPORT — `report_sequence_coverage()` does it.
+- ★**Sequence ORDER is a wire contract for non-player shapes.**★ Script threads send the sequence
+  *index*, not the name: `writeInt(st.sequence, ThreadSequenceBits)`, `ThreadSequenceBits = 4`,
+  `MaxSequenceIndex = 16` (`shapebase.h:21-29`). Re-ordering a station's sequences animates the
+  wrong thing on a live server; a clip past index 15 can never be played. Player animation is
+  *not* index-contracted — it sends the 6-bit animData SLOT (`playerUpdate.cpp:1269`).
+- **`PlayerData` (including all 51 `animData` entries) arrives OVER THE WIRE** from the server
+  (`playerUpdate.cpp:1480-1501`), so the client's local script table is irrelevant when joined.
+- **No skinning anywhere in the format** — a mesh binds to exactly one node
+  (`ts_shape.h:227-249`), and `fObjectOffset` was downgraded from a full matrix to translation-only
+  in v8 (`ts_shape.cpp:1021`). Characters are rigid parts; that is why joints crack. See
+  `Tribes Native Build\re\modern_model_system_plan.md`.
 
 ---
 

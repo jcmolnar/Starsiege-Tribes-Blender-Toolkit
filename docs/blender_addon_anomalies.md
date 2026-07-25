@@ -41,7 +41,20 @@ This document lists discrepancies between the current Blender addon implementati
   - **For normal (positive-determinant) objects, no winding swap occurs.**
 - **Impact**: Backface culling may hide the front faces of models, or normals may be calculated "inward" by the engine.
 
-**Fix**: For **all** faces (not just negative-determinant), swap indices 1 and 2 (e.g., `[v0, v1, v2]` → `[v0, v2, v1]`) before writing.
+~~**Fix**: For **all** faces, swap indices 1 and 2 before writing.~~
+★**SUPERSEDED — that fix is wrong, and measurement says so.**★ A blanket per-face swap assumes
+every model is uniformly mis-wound. Measured across `Entities.vol` — **1,944 meshes, 30,882 faces
+of genuine Dynamix content — 5.3% are wound against their own vertex normals**, concentrated in
+tiny flat cards where the surface is ambiguous or legitimately double-sided. Blanket-flipping
+damages stock-like content.
+
+**Fix as shipped** (`validate_face_winding()`, `export_dts.py`): test each face against the normals
+its own vertices already carry — a correct face's geometric normal points OPPOSITE the mean of its
+three stored normals — then **correct only a mesh that is MOSTLY backwards** (the mirrored-part
+signature; a mirror inverts winding for that object alone). Scattered violations are reported and
+left alone. On `tr_talon.dts` this fixes 131 faces across 4 meshes and touches **0** of the 1,944
+stock meshes. Complements the conversion-side centroid vote in `tools/starsiege_to_tribes.py`
+(commit `28fa645`); `tools/winding_diag.py` exists to expose where a majority vote goes wrong.
 
 ---
 
@@ -84,11 +97,16 @@ No fix needed.
 
 ---
 
-## 8. Culling Box Vertex Injection ⚠️ NEEDS VERIFICATION
+## 8. Culling Box Vertex Injection ✅ CONFIRMED REQUIRED (not a workaround)
 
-- **Observation**: `export_dts.py` (lines 1190-1191) injects two "culling box" vertices `(0,0,0,0)` and `(255,255,255,0)` at the start of every mesh.
-- **Verification Needed**: This appears to be a workaround for a specific culling issue. It's unclear if this is a standard DTS requirement. 
-- **Reference**: The master reference mentions the first two vertices are sometimes used for bounding, but this may not be universally required.
+- **Observation**: `export_dts.py` injects two "culling box" vertices `(0,0,0,0)` and `(255,255,255,0)` at the start of every mesh.
+- **VERDICT — required by the engine, do not remove.** The first two vertices of every frame block
+  *are* that frame's bounding box: `CelAnimMesh` unpacks `fVerts[FirstVert]` and `[FirstVert+1]`
+  into a `BoundingBox` for the visibility test (`ts_CelAnimMesh.cpp:129-141`), collision reads the
+  same two (`:551-554`), and every real-geometry loop starts at `i=2` (`:692`).
+- **Consequence for emitters**: geometry vertices start at index 2, and ★a face referencing index
+  0 or 1 draws a spike to the bounding-box corner★. `validate_face_winding()` in `export_dts.py`
+  now flags exactly that.
 
 ---
 
