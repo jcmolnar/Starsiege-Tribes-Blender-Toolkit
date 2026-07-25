@@ -217,10 +217,55 @@ def dts_sequence_owner_counts(path):
             except Exception:
                 durations[s] = 0.0
 
+        # Recover the 24-byte name table so ownership can be keyed by NODE NAME, not
+        # just counted.  Located by scanning for a run of nNames clean records --
+        # self-verifying, like the stride solve above.  This is what makes EXACT
+        # per-(node, sequence) gating possible; counting alone forced "this sequence
+        # drives 47 of 48 nodes, keep them all", and that one extra node was
+        # 'bounds', which owns neither 'root' nor 'looks'.  Giving it a 'root' track
+        # pinned it to -29.821 during idle and made entering the walk snap it 29
+        # units -- a visible shift at exactly the idle<->walk transitions.
+        owned = None
+        def _clean(rec):
+            z = rec.find(b"\x00")
+            if z < 1:
+                return False
+            for c in rec[:z]:
+                o = c if isinstance(c, int) else ord(c)
+                if o < 32 or o > 126:
+                    return False
+            return True
+
+        start = o
+        limit = len(data) - nNames * 24
+        while start < limit:
+            ok = True
+            for k in range(nNames):
+                if not _clean(data[start + k * 24:start + k * 24 + 24]):
+                    ok = False
+                    break
+            if ok:
+                break
+            start += 1
+        if start < limit:
+            names = [data[start + k * 24:start + k * 24 + 24].split(b"\x00")[0]
+                     .decode("ascii", "replace") for k in range(nNames)]
+            owned = set()
+            for (nmIdx, _par, nsub, firstsub, _dt) in nodes:
+                if 0 <= nmIdx < nNames:
+                    for k in range(firstsub, firstsub + nsub):
+                        if 0 <= k < nSubSeq:
+                            owned.add((names[nmIdx], subs[k][0]))
+            log("DTS name table recovered at 0x{:X} -- exact per-node ownership available"
+                .format(start))
+        else:
+            log("  !! could not locate the DTS name table -- falling back to per-sequence "
+                "counts, so a partially-owned sequence keeps every node")
+
         log("DTS v{}: {} node(s), {} sequence(s), sequence stride {} bytes "
             "(subsequence table validates for all {} records)".format(
                 version, nNodes, nSeq, best, nSubSeq))
-        return counts, durations
+        return counts, durations, owned
     except Exception as e:
         log("  !! could not read sequence ownership from the .dts: {}".format(e))
         return None
@@ -312,7 +357,7 @@ def retime_strip(strip, fs, fe, dts_dur, fps, closes):
     return strip
 
 
-def build_nla_tracks(ranges, owner_counts, durations, fps):
+def build_nla_tracks(ranges, owner_counts, durations, fps, owned):
     """One NLA track per sequence, per animated object, each strip referencing
     that sequence's sub-range of the object's single imported action.
 
@@ -343,8 +388,11 @@ def build_nla_tracks(ranges, owner_counts, durations, fps):
                     skip.add(name)
                 elif 0 < owner_counts[i] < len([o for o in bpy.data.objects
                                                 if o.animation_data and o.animation_data.action]):
-                    log("  note: '{}' drives {} node(s) in the .dts, not all -- keeping all, "
-                        "because which ones needs the name table".format(name, owner_counts[i]))
+                    log("  '{}' drives {} of the animated nodes -- gating {}".format(
+                        name, owner_counts[i],
+                        "EXACTLY, by node name" if owned else
+                        "loosely (name table unavailable), so an unowned node keeps a track "
+                        "it should not have"))
     if skip:
         log("sequences that drive NO nodes in the .dts: {}".format(sorted(skip)))
 
@@ -369,6 +417,13 @@ def build_nla_tracks(ranges, owner_counts, durations, fps):
         for si, (name, fs, fe) in enumerate(ranges):
             if name in skip:
                 continue          # faithful: this sequence owns no nodes
+            # ★EXACT ownership: the .dts says which NODES each sequence drives, and a
+            # node given a track it does not own jumps when the sequence is entered.
+            # 'bounds' owns 10 of 12 sequences -- not 'root', not 'looks' -- so a
+            # fabricated 'root' track pinned it 29 units away from where the walk
+            # starts, and the mech visibly shifted at every idle<->walk transition.
+            if owned is not None and (obj.name, si) not in owned:
+                continue
             if not has_keys_in(act, fs, fe):
                 continue          # this sequence does not drive this node
             track = ad.nla_tracks.new()
@@ -596,9 +651,9 @@ def main():
         log("  !! sequence table unreadable -- every node will own every sequence,")
         log("  !! which lets the view thread ('looks') pin nodes the walk should drive,")
         log("  !! and clip durations will come from frame counts rather than the .dts.")
-        owner_counts, durations = None, None
+        owner_counts, durations, owned = None, None, None
     else:
-        owner_counts, durations = parsed
+        owner_counts, durations, owned = parsed
     # Pick a sampling rate that gives even the SHORTEST sequence real frames.
     # Retiming to the .dts duration at Blender's default 24 fps collapsed the
     # 0.067s sequences (root / crouch root / fall) to 1.6 frames, and Blender
@@ -612,7 +667,7 @@ def main():
     bpy.context.scene.render.fps_base = 1.0
     log("sampling at {} fps (shortest sequence {:.3f}s -> {:.0f} frames)".format(
         int(fps), min(real) if real else 0.0, (min(real) if real else 0) * fps))
-    build_nla_tracks(ranges, owner_counts, durations, fps)
+    build_nla_tracks(ranges, owner_counts, durations, fps, owned)
     flip_winding_to_gltf_ccw()
     # Strips now start at frame 0, and the exporter bakes each track over its own
     # strip range -- so the scene range has to include 0 or the first key is cut.
