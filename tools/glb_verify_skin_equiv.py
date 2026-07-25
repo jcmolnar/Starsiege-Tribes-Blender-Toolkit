@@ -17,7 +17,7 @@ sys.path.insert(0, r"C:\Users\Joe\Tribes DTS Blender\tools")
 
 from glb_rigid_to_skinned import (load_glb, make_reader, world_transforms,
                                   node_local, m_mul, m_ident, m_from_trs,
-                                  xform_point)
+                                  xform_point, render_detail_subtree)
 
 
 def sample_channel(times, vals, t, is_rot):
@@ -125,9 +125,12 @@ def main(rigid_path, skinned_path):
 
             # rigid: per mesh-node, local verts through that node's animated world
             rigid_pts = []
+            _, subtree = render_detail_subtree(rjs)
             for ni, n in enumerate(rjs['nodes']):
                 if 'mesh' not in n:
                     continue
+                if subtree is not None and ni not in subtree:
+                    continue          # collision hull / lower LODs are not merged
                 for prim in rjs['meshes'][n['mesh']].get('primitives', []):
                     if prim.get('mode', 4) != 4 or 'POSITION' not in prim.get('attributes', {}):
                         continue

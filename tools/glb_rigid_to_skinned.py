@@ -217,6 +217,71 @@ def world_transforms(js):
     return world, roots
 
 
+def trailing_int(s):
+    """Mirror gltfTrailingInt (ts_gltf.cpp) so details are identified the same way
+    the loader will identify them: "head0" -> 0, "dummy_baseA64" -> 64."""
+    s = (s or '').rstrip()
+    i = len(s)
+    while i > 0 and s[i - 1].isdigit():
+        i -= 1
+    if i == len(s) or i == 0:
+        return None
+    return int(s[i:])
+
+
+def render_detail_subtree(js):
+    """The set of nodes in the HIGHEST-SIZE detail, plus that detail's root.
+
+    ★This has to mirror buildDetails + the render walk exactly, or the merged mesh
+    ends up somewhere the engine never draws.★  buildDetails (ts_gltf.cpp) makes a
+    detail out of every trailing-int node whose ancestors carry no trailing int, sorts
+    them descending by that number, and the renderer walks the chosen detail's SUBTREE
+    (ShapeInstance::animate / NodeInstance::render, ts_shapeInst.cpp:506-513).
+
+    So two things follow, and getting either wrong is silent:
+      * the skinned mesh must hang off a node INSIDE that subtree, or it is invisible;
+      * only meshes from THAT subtree may be merged -- tr_talon still carries a
+        `coll0` collision hull as detail 0, and merging it in would draw the
+        collision geometry as solid triangles.
+    """
+    nodes = js.get('nodes', [])
+    parent = {}
+    for i, n in enumerate(nodes):
+        for c in n.get('children', []):
+            parent[c] = i
+
+    details = []
+    for i, n in enumerate(nodes):
+        size = trailing_int(n.get('name'))
+        if size is None:
+            continue
+        p = parent.get(i)
+        ancestor_is_detail = False
+        while p is not None:
+            if trailing_int(nodes[p].get('name')) is not None:
+                ancestor_is_detail = True
+                break
+            p = parent.get(p)
+        if not ancestor_is_detail:
+            details.append((size, i))
+
+    if not details:
+        return None, None          # no LOD naming: caller merges everything
+
+    details.sort(key=lambda d: -d[0])
+    best_size, root = details[0]
+    subtree = set()
+    stack = [root]
+    while stack:
+        i = stack.pop()
+        subtree.add(i)
+        stack.extend(nodes[i].get('children', []))
+    log("details {} -> rendering detail {} rooted at '{}' ({} node(s))".format(
+        sorted([d[0] for d in details], reverse=True), best_size,
+        nodes[root].get('name', '?'), len(subtree)))
+    return root, subtree
+
+
 def convert(src, dst, verify=False):
     js, binc = load_glb(src)
     read = make_reader(js, binc)
@@ -226,6 +291,7 @@ def convert(src, dst, verify=False):
         raise SystemExit("no nodes/meshes in %s" % src)
 
     world, roots = world_transforms(js)
+    detail_root, detail_subtree = render_detail_subtree(js)
 
     # Joints = every node.  Keeping the whole tree means the skeleton, its names and
     # the animations stay exactly as they were; only the mesh binding changes.
@@ -237,7 +303,18 @@ def convert(src, dst, verify=False):
         return 2
 
     mesh_nodes = [i for i, n in enumerate(nodes) if 'mesh' in n]
-    log("{} node(s), {} with a mesh, {} joint(s)".format(
+    if detail_subtree is not None:
+        skipped = [i for i in mesh_nodes if i not in detail_subtree]
+        mesh_nodes = [i for i in mesh_nodes if i in detail_subtree]
+        if skipped:
+            log("skipping {} mesh node(s) outside the render detail (collision hull / "
+                "lower LODs): {}".format(
+                    len(skipped),
+                    ', '.join(nodes[i].get('name', '?') for i in skipped[:6]) +
+                    (' ...' if len(skipped) > 6 else '')))
+    if not mesh_nodes:
+        raise SystemExit("no mesh nodes inside the render detail")
+    log("{} node(s), {} mesh node(s) merged, {} joint(s)".format(
         len(nodes), len(mesh_nodes), len(joints)))
 
     new_bin = bytearray()
@@ -353,14 +430,33 @@ def convert(src, dst, verify=False):
         n.pop('mesh', None)            # former mesh nodes are now pure joints
         n.pop('skin', None)
 
-    # The skinned mesh hangs off its own node.  Its transform is ignored by the spec,
-    # so identity is both correct and unambiguous.
-    nodes.append({'name': 'skinnedMesh', 'mesh': 0, 'skin': 0})
-    mesh_node = len(nodes) - 1
+    # ★Attach to an EXISTING node inside the render detail -- do NOT append a new one.★
+    #
+    # The first version of this script appended a fresh "skinnedMesh" node and added it
+    # to the scene roots.  It produced a GLB that verified perfectly and was INVISIBLE
+    # in game, for two independent reasons, both silent:
+    #
+    #   1. The renderer only walks the chosen detail's subtree, so a mesh hanging off a
+    #      node outside it is simply never drawn.
+    #   2. It made the scene have TWO roots, and buildNodes synthesises a stub root
+    #      when there is not exactly one -- which is the documented Phase 1 failure
+    #      where ROOT MOTION is lost and every move clip resolves to idle.
+    #
+    # Reusing the detail root avoids both: it is inside the subtree by definition, and
+    # the node count and scene-root count are unchanged.  The node's own transform is
+    # ignored for skinning (spec 3.7.3.3), so it does not matter which node carries the
+    # mesh geometrically -- only which subtree it lives in.
+    mesh_node = detail_root if detail_root is not None else mesh_nodes[0]
+    nodes[mesh_node]['mesh'] = 0
+    nodes[mesh_node]['skin'] = 0
+    log("skinned mesh attached to existing node '{}' (index {})".format(
+        nodes[mesh_node].get('name', '?'), mesh_node))
+
     scene = js.get('scenes', [{}])[js.get('scene', 0)]
     scene.setdefault('nodes', roots)
-    if mesh_node not in scene['nodes']:
-        scene['nodes'].append(mesh_node)
+    if len(scene['nodes']) != 1:
+        log("!! scene has {} roots -- buildNodes will synthesise a stub root and ROOT "
+            "MOTION WILL BE LOST".format(len(scene['nodes'])))
 
     js['skins'] = [{'joints': joints, 'inverseBindMatrices': ibm_acc,
                     'name': 'rigidEquivalent'}]
