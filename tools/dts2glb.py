@@ -85,8 +85,9 @@ def parse_args():
         raise SystemExit("expected: ... --python dts2glb.py -- <in.dts> <out.glb>")
     rest = argv[argv.index("--") + 1:]
     if len(rest) < 2:
-        raise SystemExit("expected 2 args after --: <in.dts> <out.glb>")
-    return os.path.abspath(rest[0]), os.path.abspath(rest[1])
+        raise SystemExit("expected 2 args after --: <in.dts> <out.glb> [--one-lod]")
+    one_lod = any(a == "--one-lod" for a in rest[2:])
+    return os.path.abspath(rest[0]), os.path.abspath(rest[1]), one_lod
 
 
 def check_addon_freshness():
@@ -609,6 +610,79 @@ def build_nla_tracks(ranges, count_of, dur_of, fps, owned):
     return animated, strips
 
 
+def trailing_int(name):
+    """Trailing integer of a node name: "submesh_lfoot 10" -> 10, "lfoot10" -> 10.
+    Mirrors gltfTrailingInt in ts_gltf.cpp so detail roots are identified the same
+    way the loader will identify them."""
+    s = (name or "").rstrip()
+    i = len(s)
+    while i > 0 and s[i - 1].isdigit():
+        i -= 1
+    if i == len(s) or i == 0:
+        return None
+    return int(s[i:])
+
+
+def collapse_to_one_lod():
+    """Delete every detail level except the highest.
+
+    Joe's call, and it is the right one for a modern client: "it's not 1998, we
+    don't need LOD cull".  It also removes the single biggest source of keyframe
+    bloat.  ★A .dts SHARES one subsequence range across its LOD copies★ -- 662
+    records serve 1730 node-sequence pairs in rpgmalehuman -- but ts_gltf gives
+    every node its own subsequence, so the LOD duplicates cost 2.6x the keyframes
+    for geometry the player will now never see.
+
+    Detail roots are found the way ts_gltf does it: a node whose name ends in an
+    integer and which has no integer-suffixed ancestor.  Nodes with no suffix
+    (bounds, cam, coll0, dummyalways root) belong to no detail and are KEPT --
+    collision details live at negative sizes and must survive.
+    """
+    roots = {}                      # size -> [objects]
+    for obj in bpy.data.objects:
+        size = trailing_int(obj.name)
+        if size is None or size <= 0:
+            continue
+        anc = obj.parent
+        suffixed_ancestor = False
+        while anc is not None:
+            if trailing_int(anc.name) is not None:
+                suffixed_ancestor = True
+                break
+            anc = anc.parent
+        if not suffixed_ancestor:
+            roots.setdefault(size, []).append(obj)
+    if len(roots) <= 1:
+        log("LOD collapse: only one detail level present, nothing to do")
+        return
+
+    keep = max(roots)
+    log("LOD collapse: details {} -> keeping {} only".format(
+        sorted(roots, reverse=True), keep))
+
+    doomed = []
+
+    def mark(o):
+        doomed.append(o)
+        for c in o.children:
+            mark(c)
+
+    for size, objs in roots.items():
+        if size == keep:
+            continue
+        for o in objs:
+            mark(o)
+
+    names = set(o.name for o in doomed)
+    for o in doomed:
+        try:
+            bpy.data.objects.remove(o, do_unlink=True)
+        except Exception:
+            pass
+    log("LOD collapse: removed {} object(s); {} remain".format(
+        len(names), len(bpy.data.objects)))
+
+
 def set_linear_interpolation():
     """★DTS INTERPOLATES between keyframes -- LERP for translation, SLERP for
     rotation★ (docs/darkstar_dts_master_reference.md).  The importer leaves
@@ -754,6 +828,13 @@ def _decimate_linear(times, vals, eps):
     return keep
 
 
+# How far the swept angle may drift from proportional-to-time before a slerp
+# segment is cut.  1e-3 rad let the reconstruction reach 5.8e-3 on components
+# bounded to [-1,1] (~0.66 degrees) -- measurable on a limb, and over the error
+# budget.  Tightened once collapsing LODs freed up keyframe headroom.
+ANG_TOL = 1.0e-4
+
+
 def _quat_angle(a, b):
     d = abs(sum(a[c] * b[c] for c in range(4)))
     return 2.0 * math.acos(max(-1.0, min(1.0, d)))
@@ -811,9 +892,17 @@ def _decimate_slerp(times, vals, tol):
                 off = max(abs(q[c] - (an[c] * ca + bn[c] * cb)) for c in range(4))
                 if off > tol:
                     break
+                # Blender NORMALISES quaternions when it evaluates, so the baked
+                # path is nlerp: the same great-circle arc slerp takes, but at a
+                # non-uniform rate.  Requiring a UNIFORM rate is stricter than the
+                # geometry needs and costs keys -- but every looser test tried so
+                # far (plane only; plane + monotonic angle) let the reconstruction
+                # blow up to ~1.35 on components bounded to [-1,1], i.e. visibly
+                # wrong poses.  Until that is understood, take the strict test:
+                # correctness first, size second.
                 if step_dt > 0.0:
                     want = step_ang * ((times[k] - times[i]) / step_dt)
-                    if abs(_quat_angle(a, q) - want) > 1e-3:
+                    if abs(_quat_angle(a, q) - want) > ANG_TOL:
                         break
                 k += 1
         keep.append(k - 1)
@@ -1084,7 +1173,7 @@ def glb_animation_names(path):
 
 
 def main():
-    src, dst = parse_args()
+    src, dst, one_lod = parse_args()
     log("=" * 70)
     log("IN : {}  ({} bytes)".format(src, os.path.getsize(src)))
     log("OUT: {}".format(dst))
@@ -1119,6 +1208,9 @@ def main():
                 last = max(last, int(kp.co[0]))
     if last > bpy.context.scene.frame_end:
         bpy.context.scene.frame_end = last
+
+    if one_lod:
+        collapse_to_one_lod()
 
     set_linear_interpolation()
 
