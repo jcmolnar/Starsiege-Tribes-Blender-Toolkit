@@ -235,7 +235,50 @@ def has_keys_in(act, fs, fe):
     return False
 
 
-def retime_strip(strip, fs, fe, dts_dur, fps):
+def sequence_closes(fs, fe, eps=1e-3):
+    """Does the pose at the sequence's LAST frame equal the pose at its FIRST?
+
+    A cyclic DTS sequence ends where it began, so the loop is seamless -- measured
+    on tr_talon's 'run', the root node runs -0.4901 (f1) ... -10.7187 (f43) and
+    back to -0.4901 (f44).  That closing keyframe is NOT a transition into the next
+    sequence and must be kept, or the cycle wraps with a 10-unit snap: Joe saw the
+    mech "shift to the right a bit" near the end of every walk cycle.
+
+    For a STATIC sequence the last frame does not match ('root' holds -29.821 then
+    ends at -0.490), and there it really is a stray frame -- keeping it made the
+    engine flicker between two poses 15 times a second.  So decide from the data
+    instead of applying one rule to both.
+
+    Returns the FRACTION of channels that close, because an all-or-nothing test
+    cannot distinguish "one node is off by a float epsilon" from "this is not a
+    cycle".  Measured on tr_talon the answer is sharply bimodal, so the 0.90
+    threshold sits in empty space:
+
+        run         100.0%   <- closes
+        Seq12_RLeg  100.0%   <- closes
+        everything else 56.0 - 72.6%
+
+    ★That also corrected an assumption of mine: I expected 'fastrun' and 'sprint'
+    to be closed walk cycles too, and they are NOT (56-59%).  Only 'run' is a
+    properly closed cycle in this shape -- which is precisely the one Joe saw
+    snap.★"""
+    same = 0
+    total = 0
+    for obj in bpy.data.objects:
+        ad = obj.animation_data
+        if not ad or not ad.action:
+            continue
+        for fc in action_fcurves(ad.action):
+            try:
+                total += 1
+                if abs(fc.evaluate(fs) - fc.evaluate(fe)) <= eps:
+                    same += 1
+            except Exception:
+                pass
+    return (float(same) / total) if total else 0.0
+
+
+def retime_strip(strip, fs, fe, dts_dur, fps, closes):
     """Place the strip at scene frame 0 and stretch it to the DTS's AUTHORED
     duration.
 
@@ -250,15 +293,12 @@ def retime_strip(strip, fs, fe, dts_dur, fps):
         run 2.667s -> 1.792s (49% too fast), root 0.067s -> 0.167s (2.5x too
         slow).  The ratios are not a constant, so this is not an fps mismatch and
         cannot be fixed by changing the scene rate."""
-    # ★The "End of <seq>" marker frame is EXCLUSIVE.★ The importer lays sequences
-    # end to end in one action, so the frame the end marker sits on is already
-    # interpolating toward the NEXT sequence's pose.  Measured on the exported
-    # 'root' clip: 8 of 9 samples held one pose and the last snapped away
-    # (bounds.translation.z -29.821 x8 then -0.490).  Every sequence is cyclic, so
-    # the engine wrapped between the held pose and that stray frame -- at 15 cycles
-    # a second for a 0.067s idle.  Joe: "rapid jittering between two animation
-    # frames" while walking and idle.  Drop the transition frame.
-    last = fe - 1 if fe - 1 > fs else fe
+    # Whether the "End of <seq>" frame belongs to the sequence is decided per
+    # sequence by sequence_closes(): it is the cycle-closing keyframe when the pose
+    # returns to the start, and a stray transition frame when it does not.  Keeping
+    # a stray one flickers the pose 15x a second; dropping a closing one snaps the
+    # root 10 units on every wrap.  Both were observed in game.
+    last = fe if closes else (fe - 1 if fe - 1 > fs else fe)
     action_len = float(last - fs)
     strip.action_frame_start = float(fs)
     strip.action_frame_end = float(last)
@@ -308,6 +348,17 @@ def build_nla_tracks(ranges, owner_counts, durations, fps):
     if skip:
         log("sequences that drive NO nodes in the .dts: {}".format(sorted(skip)))
 
+    closes = {}
+    frac = {}
+    for name, fs, fe in ranges:
+        frac[name] = sequence_closes(fs, fe)
+        closes[name] = frac[name] >= 0.90
+    log("cycle closure (fraction of channels whose last frame == first frame):")
+    for name, _, _ in ranges:
+        log("    {:<14} {:5.1f}%  {}".format(
+            name, frac[name] * 100.0,
+            "CLOSES - keep last frame" if closes[name] else "stray - drop last frame"))
+
     for obj in bpy.data.objects:
         ad = obj.animation_data
         if not ad or not ad.action:
@@ -330,7 +381,7 @@ def build_nla_tracks(ranges, owner_counts, durations, fps):
             per_seq[name] += 1
             retime_strip(strip, fs, fe,
                          durations[si] if durations and si < len(durations) else 0.0,
-                         fps)
+                         fps, closes[name])
             strip.extrapolation = 'HOLD'
             strip.blend_type = 'REPLACE'
             strip.use_animated_influence = False
@@ -380,7 +431,7 @@ def build_nla_tracks(ranges, owner_counts, durations, fps):
                 # transform at both ends of a range the .dts gives it no track in.
                 retime_strip(strip, fs, fe,
                              durations[si] if durations and si < len(durations) else 0.0,
-                             fps)
+                             fps, closes.get(name, False))
                 per_seq[name] = 1
                 placed = True
                 log("  '{}' owns no nodes in the DTS -- parked on inert leaf '{}' "
