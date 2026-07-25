@@ -369,6 +369,97 @@ def find_closest_normal(normal):
     return best_idx
 
 
+def validate_face_winding(packed_verts, faces, mesh_name, auto_fix=True,
+                          majority=0.75, eps=0.10):
+    """Check each face's winding against the normals stored on its own vertices.
+
+    DTS is clockwise; Blender is counter-clockwise. The exporter's winding switch is a
+    per-EXPORT choice, so it cannot help a file where only SOME objects are wrong -- which is
+    exactly what happens when a part is mirrored in Blender (a mirror inverts winding for that
+    object alone) or when new geometry is added to a round-tripped model. That shipped
+    tr_talon.dts with 149 of 898 faces backwards: three copies of one mirrored part, 43 of its
+    48 faces each. A backwards face is culled from the side it is meant to be seen from.
+
+    The check needs no external truth, because each vertex already carries a normal (an index
+    into the engine's 256-entry table): a correctly wound face's geometric normal points
+    OPPOSITE the mean of its three stored vertex normals.
+
+    ★It deliberately does NOT correct every violation.★ Measured across Entities.vol -- 1,944
+    meshes, 30,882 faces of genuine Dynamix geometry -- 5.3% violate this, concentrated in tiny
+    flat cards where the mean-normal test is ambiguous or the surface is legitimately
+    double-sided. Blanket-flipping would damage stock-like content. So a violation is only
+    corrected when the MESH is mostly backwards (the mirrored-part signature); scattered
+    singles are reported and left alone.
+
+    Sign only, so the packed integer coordinates are used directly: frame scale is positive, and
+    a positive scale cannot flip the cross product.
+
+    Returns (violations, fixed, ambiguous).
+    """
+    def _cross_sign_dot(i0, i1, i2):
+        p0, p1, p2 = packed_verts[i0], packed_verts[i1], packed_verts[i2]
+        e1 = (p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2])
+        e2 = (p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2])
+        ng = (e1[1] * e2[2] - e1[2] * e2[1],
+              e1[2] * e2[0] - e1[0] * e2[2],
+              e1[0] * e2[1] - e1[1] * e2[0])
+        gl = (ng[0] ** 2 + ng[1] ** 2 + ng[2] ** 2) ** 0.5
+        if gl < 1e-9:
+            return None                      # degenerate triangle
+        nv = [0.0, 0.0, 0.0]
+        for idx in (i0, i1, i2):
+            n = NORMAL_TABLE[packed_verts[idx][3]]
+            nv[0] += n[0]; nv[1] += n[1]; nv[2] += n[2]
+        vl = (nv[0] ** 2 + nv[1] ** 2 + nv[2] ** 2) ** 0.5
+        if vl < 1e-9:
+            return None                      # opposed normals cancel: no usable answer
+        return (ng[0] * nv[0] + ng[1] * nv[1] + ng[2] * nv[2]) / (gl * vl)
+
+    bad, good, ambiguous, bbox_refs = [], 0, 0, 0
+    for fi, face in enumerate(faces):
+        v = face['vertex_indices']
+        if max(v) >= len(packed_verts):
+            continue
+        # Slots 0 and 1 of every frame are the bounding box, not geometry
+        # (ts_CelAnimMesh.cpp:129-141) -- a face referencing them draws a spike to the corner.
+        if min(v) < 2:
+            bbox_refs += 1
+            continue
+        dot = _cross_sign_dot(v[0], v[1], v[2])
+        if dot is None:
+            continue
+        if dot > eps:
+            bad.append(fi)
+        elif dot < -eps:
+            good += 1
+        else:
+            ambiguous += 1
+
+    if bbox_refs:
+        print(f"  [WINDING] {mesh_name}: ★{bbox_refs} face(s) reference the frame bbox verts "
+              f"(slot 0/1) -- these render as a spike to the bounding-box corner★")
+
+    measurable = len(bad) + good
+    fixed = 0
+    if bad and measurable:
+        ratio = len(bad) / float(measurable)
+        if auto_fix and ratio >= majority:
+            for fi in bad:                    # mesh is mirrored: correct it
+                f = faces[fi]
+                f['vertex_indices'] = [f['vertex_indices'][0], f['vertex_indices'][2],
+                                       f['vertex_indices'][1]]
+                f['texture_indices'] = [f['texture_indices'][0], f['texture_indices'][2],
+                                        f['texture_indices'][1]]
+            fixed = len(bad)
+            print(f"  [WINDING] {mesh_name}: ★FIXED {fixed}/{measurable} backwards faces "
+                  f"({ratio:.0%} -- mirrored-part signature)★")
+        else:
+            print(f"  [WINDING] {mesh_name}: {len(bad)}/{measurable} faces backwards "
+                  f"({ratio:.0%}) -- left alone; stock content runs ~5% and blanket-flipping "
+                  f"would damage it. Inspect if the model looks see-through.")
+    return len(bad), fixed, ambiguous
+
+
 def material_map_file(mat):
     """Texture filename for the DTS material list.
 
@@ -2069,6 +2160,12 @@ class ExportDTS(bpy.types.Operator, ExportHelper):
 
             # REFRESH: Axe.dts has faces in REVERSED order compared to Blender loops
             faces.reverse()
+
+            # Winding is validated against the normals the vertices already carry, because the
+            # convert_winding switch above is per-EXPORT and cannot describe a file where only
+            # SOME objects are mirrored. Corrects only a mesh that is MOSTLY backwards; see the
+            # function for why scattered violations must be left alone.
+            validate_face_winding(packed_verts, faces, obj.name)
 
             # Compute radius: Use stored DTS value if available AND geometry not modified
             if "dts_mesh_radius" in obj and not geometry_modified:
