@@ -1021,6 +1021,104 @@ def _reconstruct_error(times, vals, keep, rotation=False):
     return worst
 
 
+def reorder_animations(path, seq_names):
+    """Put the GLB's animations back into the .dts SEQUENCE TABLE order.
+
+    ★This is a WIRE CONTRACT, not tidiness.★  A script thread transmits a 4-bit
+    SEQUENCE INDEX (ThreadSequenceBits = 4, MaxSequenceIndex = 16, shapebase.h:21-29,
+    packed at shapeBase.cpp:1337-1382), and ts_gltf assigns sequence indices in glTF
+    animation order (buildAnimations pushes one Sequence per animation, in order).  So
+    for anything SCRIPT drives -- stations, turrets, sensors, mines, static shapes --
+    glTF animation index IS the number the server sends.
+
+    The exported order is NOT the .dts order.  Track creation follows the importer's
+    TIMELINE MARKERS, and the marker layout does not match the sequence table, so
+    animations came out permuted.  Measured before this fix:
+
+        mortar_turret.DTS  .dts: fire, visibility, turn, elevate, power
+                           .glb: turn, fire, elevate, power, visibility   (all 5 wrong)
+        gunturet.DTS       .dts: turn, elevate, fire
+                           .glb: turn, fire, elevate                      (1 and 2 swapped)
+
+    A turret built from that plays the WRONG animation for a correct wire value, and
+    nothing at runtime can notice: the index is valid, it just means something else.
+    Players were unaffected -- their wire value is a SLOT bound by NAME through animData
+    (playerUpdate.cpp:1269) -- which is exactly why this survived the player testing.
+
+    Sequences the .dts has but the GLB does not (one that drives no nodes and was
+    dropped) cannot be repaired by reordering: every later index still shifts.  Those
+    are reported loudly rather than silently tolerated.
+    """
+    if not seq_names:
+        return
+    with open(path, 'rb') as f:
+        data = f.read()
+    if data[0:4] != b'glTF':
+        return
+    off = 12
+    chunks, js = [], None
+    while off + 8 <= len(data):
+        clen, ctype = struct.unpack_from('<I4s', data, off)
+        off += 8
+        chunk = data[off:off + clen]
+        off += clen
+        if ctype == b'JSON':
+            js = json.loads(chunk.decode('utf-8'))
+            chunks.append([ctype, None])
+        else:
+            chunks.append([ctype, chunk])
+    if js is None or not js.get('animations'):
+        return
+
+    anims = js['animations']
+    by_name = {}
+    for a in anims:
+        by_name.setdefault(a.get('name'), []).append(a)
+
+    ordered, missing = [], []
+    for nm in seq_names:
+        bucket = by_name.get(nm)
+        if bucket:
+            ordered.append(bucket.pop(0))
+        else:
+            missing.append(nm)
+    # anything the GLB has that the .dts table did not name, kept at the end
+    extra = [a for bucket in by_name.values() for a in bucket]
+
+    before = [a.get('name') for a in anims]
+    after = [a.get('name') for a in ordered + extra]
+    if before == after:
+        log("sequence order already matches the .dts table")
+        return
+
+    js['animations'] = ordered + extra
+    new_json = json.dumps(js, separators=(',', ':')).encode('utf-8')
+    while len(new_json) % 4:
+        new_json += b' '
+    out = bytearray()
+    for ctype, payload in chunks:
+        body = new_json if ctype == b'JSON' else payload
+        if ctype != b'JSON':
+            while len(body) % 4:
+                body = body + b'\x00'
+        out += struct.pack('<I4s', len(body), ctype) + body
+    with open(path, 'wb') as f:
+        f.write(struct.pack('<4sII', b'glTF', 2, 12 + len(out)) + bytes(out))
+
+    log("REORDERED animations into .dts sequence order (glTF index == wire index):")
+    log("   was: {}".format(before[:8]))
+    log("   now: {}".format(after[:8]))
+    if missing:
+        log("  !! {} sequence(s) in the .dts have NO animation in the GLB: {}"
+            .format(len(missing), missing))
+        log("  !! every index after the first of those is still shifted -- for a "
+            "SCRIPT-DRIVEN shape (station/turret/sensor/mine) that breaks the 4-bit "
+            "sequence index on the wire.")
+    if extra:
+        log("  note: {} animation(s) not named in the .dts sequence table, appended "
+            "after the contracted range: {}".format(len(extra), [a.get('name') for a in extra]))
+
+
 def inject_sequence_extras(path, cyclic_of, prio_of):
     """Carry the .dts's authored fCyclic / fPriority into the GLB as animation extras.
 
@@ -1487,8 +1585,10 @@ def main():
         return 5
 
     decimate_glb_animations(dst)
-    # After decimation, which rewrites the whole container -- otherwise the extras
-    # would be dropped when the JSON chunk is rebuilt.
+    # Both post-passes run AFTER decimation, which rewrites the whole container --
+    # anything written earlier would be dropped when the JSON chunk is rebuilt.
+    # Reorder BEFORE the extras so the extras land on the final animation list.
+    reorder_animations(dst, seq_names if parsed else None)
     inject_sequence_extras(dst, cyclic_of, prio_of)
 
     names, js, raw, bin_off = glb_animation_names(dst)
