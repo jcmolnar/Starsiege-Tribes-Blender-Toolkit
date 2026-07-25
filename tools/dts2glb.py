@@ -250,9 +250,18 @@ def retime_strip(strip, fs, fe, dts_dur, fps):
         run 2.667s -> 1.792s (49% too fast), root 0.067s -> 0.167s (2.5x too
         slow).  The ratios are not a constant, so this is not an fps mismatch and
         cannot be fixed by changing the scene rate."""
-    action_len = float(fe - fs)
+    # ★The "End of <seq>" marker frame is EXCLUSIVE.★ The importer lays sequences
+    # end to end in one action, so the frame the end marker sits on is already
+    # interpolating toward the NEXT sequence's pose.  Measured on the exported
+    # 'root' clip: 8 of 9 samples held one pose and the last snapped away
+    # (bounds.translation.z -29.821 x8 then -0.490).  Every sequence is cyclic, so
+    # the engine wrapped between the held pose and that stray frame -- at 15 cycles
+    # a second for a 0.067s idle.  Joe: "rapid jittering between two animation
+    # frames" while walking and idle.  Drop the transition frame.
+    last = fe - 1 if fe - 1 > fs else fe
+    action_len = float(last - fs)
     strip.action_frame_start = float(fs)
-    strip.action_frame_end = float(fe)
+    strip.action_frame_end = float(last)
     strip.frame_start = 0.0
     strip.frame_end = action_len
     if dts_dur and dts_dur > 0.0 and action_len > 0.0:
@@ -568,14 +577,17 @@ def main():
             export_animations=True,
             export_animation_mode='NLA_TRACKS',
             export_yup=True,
-            # Keep constant channels rather than let the size optimizer fold them.
-            # A clip whose every channel is constant is exactly the kind this
-            # pipeline must not lose: tr_talon's "looks" (seq 6) carries NO tracks
-            # at all in the DTS, and a missing "looks" is what crashes the client
-            # (player.cpp:388/700).  NB this flag did NOT recover the one clip that
-            # still drops -- see the KNOWN GAP note in main() -- so it is here for
-            # correctness of intent, not as a fix for that.
+            # ★Blender DISCARDS an animation whose every channel is constant.★ That
+            # is what silently ate Seq12_RLeg all along, and then took root / crouch
+            # root / fall / Seq11_LLeg the moment the trailing transition frame was
+            # removed and they became genuinely static.  A static sequence is
+            # perfectly legal in DTS -- 'root' IS the idle pose, and 'looks' carries
+            # no tracks at all -- and losing one loses its NAME, which is how the
+            # engine binds sequences.  A missing "looks" crashes the client outright
+            # (player.cpp:388 -> :700).  So keep constant channels AND constant
+            # object animations.
             export_optimize_animation_size=False,
+            export_optimize_animation_keep_anim_object=True,
         )
     except Exception:
         log("!! EXPORT RAISED:")
