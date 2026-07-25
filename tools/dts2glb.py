@@ -53,12 +53,29 @@ Why this is not just "import, then export_scene.gltf":
       export_force_sampling=False is IGNORED in NLA_TRACKS mode (verified:
       byte-identical output), because NLA evaluation requires baking.
 
-  The way out is one glTF ACTION per sequence exported in ACTIONS mode with
-  sampling off, which keeps the .dts's own sparse keys.  That needs Blender 5.0's
-  layered/slotted Action authoring API -- the thing the NLA trick was chosen to
-  avoid -- so it is real work, not a flag.  Until then this converter is for
-  shapes in tr_talon's class; it will TELL you when a shape is over budget rather
-  than silently shipping a truncated one.
+  Two things fixed most of it:
+    * --one-lod deletes all but the highest detail.  ★A .dts SHARES one subsequence
+      range across its LOD copies★ (662 records serve 1730 node-sequence pairs)
+      while ts_gltf gives every node its own -- 2.6x the keyframes for geometry a
+      modern client never shows.  Joe's call, and the right one.
+    * decimate_glb_animations() drops every key that interpolation already
+      reproduces, verified by reconstruction error and HARD-FAILING above 2e-3.
+
+  ★WHAT REMAINS IS ONE BUG, NOT AN ARCHITECTURAL WALL.★ 43 sequences x 36 nodes x
+  the .dts's own 13 keys per track is ~20,000 -- comfortably under the cap.  So the
+  gap is the ROTATION metric failing to recover that density:
+
+      component-linear        8.8x   over cap
+      plane only             43.5x   error 1.39
+      plane + monotonic      43.5x   error 1.35
+      plane + uniform rate    7.7x   error 1.24e-03, 2.6x over cap  <- current
+
+  Every loose test explodes to ~1.35 on components bounded to [-1,1] (about sqrt 2)
+  as soon as segments grow long, which looks like a quaternion SIGN-handling defect
+  rather than an inherent cost -- start there.  Blender normalises quaternions on
+  evaluation, so the baked path is nlerp: the same great-circle arc slerp takes but
+  at a non-uniform rate.  The shipped setting is deliberately the strict one: it can
+  only be too big, never wrong.
 """
 
 import bpy
