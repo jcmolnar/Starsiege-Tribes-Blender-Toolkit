@@ -254,17 +254,44 @@ def dts_sequence_owner_counts(path):
         # 'bounds', which owns neither 'root' nor 'looks'.  Giving it a 'root' track
         # pinned it to -29.821 during idle and made entering the walk snap it 29
         # units -- a visible shift at exactly the idle<->walk transitions.
-        owned = None
+        # ★Locate the 24-byte name table -- and VALIDATE the candidate.★
+        #
+        # A "printable ASCII, NUL-terminated" test alone is not enough: a run of
+        # spaces passes it.  On rpgmalehuman.dts that matched a decoy region and
+        # every node name came back as ' ' or '!', so the ownership set matched
+        # nothing and EVERY sequence got zero strips.  (The name check caught it --
+        # 43 names lost, hard fail -- but a decoy could in principle yield a
+        # plausible-but-wrong map, so validate rather than trust the first hit.)
+        #
+        # The validation that actually discriminates: resolve the names the NODES
+        # reference and require them to look like node names -- 2+ chars, containing
+        # a letter or digit, and mostly distinct.  Real node tables pass easily;
+        # runs of filler do not.
         def _clean(rec):
             z = rec.find(b"\x00")
             if z < 1:
                 return False
             for c in rec[:z]:
-                o = c if isinstance(c, int) else ord(c)
-                if o < 32 or o > 126:
+                ch = c if isinstance(c, int) else ord(c)
+                if ch < 32 or ch > 126:
                     return False
             return True
 
+        def _plausible(cand):
+            resolved = []
+            for (nmIdx, _p, _ns, _fs, _dt) in nodes:
+                if not (0 <= nmIdx < nNames):
+                    return None
+                s = cand[nmIdx]
+                if len(s) < 2 or not any(c.isalnum() for c in s):
+                    return None
+                resolved.append(s)
+            if len(set(resolved)) < max(2, int(len(resolved) * 0.5)):
+                return None            # a real table does not name half the nodes alike
+            return resolved
+
+        names = None
+        found_at = -1
         start = o
         limit = len(data) - nNames * 24
         while start < limit:
@@ -274,27 +301,55 @@ def dts_sequence_owner_counts(path):
                     ok = False
                     break
             if ok:
-                break
+                cand = [data[start + k * 24:start + k * 24 + 24].split(b"\x00")[0]
+                        .decode("ascii", "replace") for k in range(nNames)]
+                if _plausible(cand) is not None:
+                    names = cand
+                    found_at = start
+                    break
             start += 1
-        if start < limit:
-            names = [data[start + k * 24:start + k * 24 + 24].split(b"\x00")[0]
-                     .decode("ascii", "replace") for k in range(nNames)]
+
+        owned = None
+        seq_names = None
+        if names is not None:
+            # Sequence::fName is the first field of the record whose stride was
+            # solved above, so ownership and durations can be keyed by NAME.  That
+            # matters: keying by marker INDEX assumes every sequence has a timeline
+            # marker, and rpgmalehuman has 44 sequences but only 43 markers -- one
+            # unmarked sequence shifts every index after it.
+            seq_names = []
+            for s in range(nSeq):
+                ni = struct.unpack_from("<i", data, seq_off + s * best)[0]
+                seq_names.append(names[ni] if 0 <= ni < nNames else "seq%d" % s)
             owned = set()
             for (nmIdx, _par, nsub, firstsub, _dt) in nodes:
-                if 0 <= nmIdx < nNames:
-                    for k in range(firstsub, firstsub + nsub):
-                        if 0 <= k < nSubSeq:
-                            owned.add((names[nmIdx], subs[k][0]))
-            log("DTS name table recovered at 0x{:X} -- exact per-node ownership available"
-                .format(start))
+                for k in range(firstsub, firstsub + nsub):
+                    if 0 <= k < nSubSeq:
+                        si = subs[k][0]
+                        if 0 <= si < nSeq:
+                            owned.add((names[nmIdx], seq_names[si]))
+            log("DTS name table validated at 0x{:X} -- exact per-node ownership, keyed by name"
+                .format(found_at))
+            # Duplicate sequence names COLLAPSE: markers are keyed by name and glTF
+            # merges same-named tracks, so N sequences become N-distinct animations.
+            # rpgmalehuman.dts has two called 'wave' (44 sequences, 43 names).
+            # Harmless for a player -- GetSequenceIndex takes the first match and the
+            # wire carries a SLOT -- but for a non-player shape sequence indices
+            # 0..15 ARE a wire contract, so collapsing shifts them.
+            dupes = sorted(set(n for n in seq_names if seq_names.count(n) > 1))
+            if dupes:
+                log("  note: duplicate sequence name(s) in the .dts {} -- {} sequences "
+                    "collapse to {} distinct clips. Fine for a player (slot-based wire); "
+                    "NOT fine for a station/vehicle, where index 0..15 is contracted."
+                    .format(dupes, nSeq, len(set(seq_names))))
         else:
-            log("  !! could not locate the DTS name table -- falling back to per-sequence "
+            log("  !! no name table passed validation -- falling back to per-sequence "
                 "counts, so a partially-owned sequence keeps every node")
 
         log("DTS v{}: {} node(s), {} sequence(s), sequence stride {} bytes "
             "(subsequence table validates for all {} records)".format(
                 version, nNodes, nSeq, best, nSubSeq))
-        return counts, durations, owned
+        return counts, durations, owned, seq_names
     except Exception as e:
         log("  !! could not read sequence ownership from the .dts: {}".format(e))
         return None
@@ -386,7 +441,7 @@ def retime_strip(strip, fs, fe, dts_dur, fps, closes):
     return strip
 
 
-def build_nla_tracks(ranges, owner_counts, durations, fps, owned):
+def build_nla_tracks(ranges, count_of, dur_of, fps, owned):
     """One NLA track per sequence, per animated object, each strip referencing
     that sequence's sub-range of the object's single imported action.
 
@@ -410,15 +465,15 @@ def build_nla_tracks(ranges, owner_counts, durations, fps, owned):
     # Which sequences drive nothing, straight from the .dts.  Marker order is
     # sequence order, so ranges[i] pairs with owner_counts[i].
     skip = set()
-    if owner_counts:
-        for i, (name, _, _) in enumerate(ranges):
-            if i < len(owner_counts):
-                if owner_counts[i] == 0:
+    if count_of:
+        for (name, _, _) in ranges:
+            if name in count_of:
+                if count_of[name] == 0:
                     skip.add(name)
-                elif 0 < owner_counts[i] < len([o for o in bpy.data.objects
-                                                if o.animation_data and o.animation_data.action]):
+                elif 0 < count_of[name] < len([o for o in bpy.data.objects
+                                               if o.animation_data and o.animation_data.action]):
                     log("  '{}' drives {} of the animated nodes -- gating {}".format(
-                        name, owner_counts[i],
+                        name, count_of[name],
                         "EXACTLY, by node name" if owned else
                         "loosely (name table unavailable), so an unowned node keeps a track "
                         "it should not have"))
@@ -451,7 +506,7 @@ def build_nla_tracks(ranges, owner_counts, durations, fps, owned):
             # 'bounds' owns 10 of 12 sequences -- not 'root', not 'looks' -- so a
             # fabricated 'root' track pinned it 29 units away from where the walk
             # starts, and the mech visibly shifted at every idle<->walk transition.
-            if owned is not None and (obj.name, si) not in owned:
+            if owned is not None and (obj.name, name) not in owned:
                 continue
             if not has_keys_in(act, fs, fe):
                 continue          # this sequence does not drive this node
@@ -463,9 +518,7 @@ def build_nla_tracks(ranges, owner_counts, durations, fps, owned):
                 log("  !! strip '{}' on '{}' failed: {}".format(name, obj.name, e))
                 continue
             per_seq[name] += 1
-            retime_strip(strip, fs, fe,
-                         durations[si] if durations and si < len(durations) else 0.0,
-                         fps, closes[name])
+            retime_strip(strip, fs, fe, dur_of.get(name, 0.0), fps, closes[name])
             strip.extrapolation = 'HOLD'
             strip.blend_type = 'REPLACE'
             strip.use_animated_influence = False
@@ -513,9 +566,8 @@ def build_nla_tracks(ranges, owner_counts, durations, fps, owned):
                 # NAME disappears -- which is the condition that crashed the client.
                 # The pose is constant anyway: the importer keys this node's held
                 # transform at both ends of a range the .dts gives it no track in.
-                retime_strip(strip, fs, fe,
-                             durations[si] if durations and si < len(durations) else 0.0,
-                             fps, closes.get(name, False))
+                retime_strip(strip, fs, fe, dur_of.get(name, 0.0), fps,
+                             closes.get(name, False))
                 per_seq[name] = 1
                 placed = True
                 log("  '{}' owns no nodes in the DTS -- parked on inert leaf '{}' "
@@ -710,15 +762,24 @@ def main():
         log("  !! sequence table unreadable -- every node will own every sequence,")
         log("  !! which lets the view thread ('looks') pin nodes the walk should drive,")
         log("  !! and clip durations will come from frame counts rather than the .dts.")
-        owner_counts, durations, owned = None, None, None
+        count_of, dur_of, owned = {}, {}, None
+        durations = None
     else:
-        owner_counts, durations, owned = parsed
+        counts, durations, owned, seq_names = parsed
+        # Key everything by sequence NAME.  Marker INDEX is not a safe key: this
+        # shape has 44 sequences and 43 timeline markers, so one unmarked sequence
+        # shifts every index after it.
+        if seq_names:
+            count_of = dict(zip(seq_names, counts))
+            dur_of = dict(zip(seq_names, durations))
+        else:
+            count_of, dur_of = {}, {}
     # Pick a sampling rate that gives even the SHORTEST sequence real frames.
     # Retiming to the .dts duration at Blender's default 24 fps collapsed the
     # 0.067s sequences (root / crouch root / fall) to 1.6 frames, and Blender
     # exported nothing for them -- the clip, and its NAME, vanished.  glTF stores
     # times in SECONDS, so a higher rate costs samples, not correctness.
-    real = [d for d in (durations or []) if d and d > 0.0]
+    real = [d for d in dur_of.values() if d and d > 0.0]
     fps = 24.0
     if real:
         fps = min(240.0, max(24.0, math.ceil(8.0 / min(real))))
@@ -726,7 +787,7 @@ def main():
     bpy.context.scene.render.fps_base = 1.0
     log("sampling at {} fps (shortest sequence {:.3f}s -> {:.0f} frames)".format(
         int(fps), min(real) if real else 0.0, (min(real) if real else 0) * fps))
-    build_nla_tracks(ranges, owner_counts, durations, fps, owned)
+    build_nla_tracks(ranges, count_of, dur_of, fps, owned)
     flip_winding_to_gltf_ccw()
     # Strips now start at frame 0, and the exporter bakes each track over its own
     # strip range -- so the scene range has to include 0 or the first key is cut.
@@ -787,11 +848,7 @@ def main():
             if mx is not None:
                 hi = mx if hi is None else max(hi, mx)
         if lo is not None:
-            want = 0.0
-            if durations:
-                idx = [i for i, (nm, _, _) in enumerate(ranges) if nm == a.get('name')]
-                if idx and idx[0] < len(durations):
-                    want = durations[idx[0]]
+            want = dur_of.get(a.get('name'), 0.0)
             log("    clip {:<14} {:.3f}..{:.3f}s   .dts says {:.3f}s  {}".format(
                 a.get('name'), lo, hi or 0.0, want,
                 "OK" if want <= 0 or abs((hi or 0.0) - want) < 0.05 else "SPEED MISMATCH"))
