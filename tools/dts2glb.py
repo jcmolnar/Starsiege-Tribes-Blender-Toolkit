@@ -34,6 +34,31 @@ Why this is not just "import, then export_scene.gltf":
   No new Actions are authored: an NLA strip can reference a SUB-RANGE of an
   existing action via action_frame_start/action_frame_end, which sidesteps
   Blender 5.0's layered/slotted Action authoring API entirely.
+
+★KNOWN CEILING -- SEQUENCE COUNT vs THE Int16 KEYFRAME CAP★
+
+  This approach is proven on tr_talon.dts (12 sequences, 48 animated nodes): every
+  check passes and it plays correctly in game.  It does NOT currently scale to a
+  shape with many sequences, and rpgmalehuman.dts (44 sequences, ~1730
+  node-sequence pairs) is past the limit.  The squeeze:
+
+    * ts_gltf builds one TS::Shape keyframe AND one transform per sampled time,
+      per (node, sequence).  Version 8 narrowed those indices to Int16, so the
+      loader caps at 32000 keyframes and drops the rest.
+    * A rate high enough to keep a 0.033s sequence alive (240 fps) produces
+      678,946 keyframes -- 21x the cap.
+    * Dropping to the ~10 fps the budget allows then breaks duration fidelity
+      (run 0.600s vs the authored 0.667s) and looks choppy on a humanoid.
+    * Sparse export would fix both -- the .dts holds only 8,635 keys -- but
+      export_force_sampling=False is IGNORED in NLA_TRACKS mode (verified:
+      byte-identical output), because NLA evaluation requires baking.
+
+  The way out is one glTF ACTION per sequence exported in ACTIONS mode with
+  sampling off, which keeps the .dts's own sparse keys.  That needs Blender 5.0's
+  layered/slotted Action authoring API -- the thing the NLA trick was chosen to
+  avoid -- so it is real work, not a flag.  Until then this converter is for
+  shapes in tr_talon's class; it will TELL you when a shape is over budget rather
+  than silently shipping a truncated one.
 """
 
 import bpy
@@ -774,19 +799,53 @@ def main():
             dur_of = dict(zip(seq_names, durations))
         else:
             count_of, dur_of = {}, {}
-    # Pick a sampling rate that gives even the SHORTEST sequence real frames.
-    # Retiming to the .dts duration at Blender's default 24 fps collapsed the
-    # 0.067s sequences (root / crouch root / fall) to 1.6 frames, and Blender
-    # exported nothing for them -- the clip, and its NAME, vanished.  glTF stores
-    # times in SECONDS, so a higher rate costs samples, not correctness.
+    # ★Pick the sampling rate against BOTH ends of the squeeze.★
+    #
+    # Too low and a short sequence collapses: retiming at Blender's default 24 fps
+    # reduced tr_talon's 0.067s sequences to 1.6 frames and Blender exported nothing
+    # for them, so the clip and its NAME vanished.
+    #
+    # Too high and the SHAPE overflows.  TS::Shape narrowed its keyframe and
+    # transform indices to Int16 at version 8, so ts_gltf.cpp caps them
+    # (MaxKeyframes 32000, MaxTransforms 65000) and DROPS the remaining animation
+    # once past it.  ts_gltf builds one subsequence per (node, sequence) with one
+    # keyframe -- and one transform -- per sampled time, so cost is
+    # owners x duration x fps summed over sequences.  rpgmalehuman.dts has 44
+    # sequences over ~1730 node-sequence pairs: at 240 fps that is 678,946
+    # keyframes, 21x the cap, and almost every animation would have been silently
+    # truncated.  The .dts itself holds only 8,635.
+    #
+    # So: take the HIGHEST rate whose estimated cost fits the budget, and say what
+    # was traded if the shortest sequence still cannot get 2 frames.
+    KF_BUDGET = 28000          # leave headroom under MaxKeyframes 32000
+
+    def _estimate(f):
+        total = 0
+        for nm, _, _ in ranges:
+            owners = count_of.get(nm, 0) or 1
+            dsec = dur_of.get(nm, 0.0)
+            total += owners * (int(dsec * f) + 2)
+        return total
+
     real = [d for d in dur_of.values() if d and d > 0.0]
+    shortest = min(real) if real else 0.0
     fps = 24.0
-    if real:
-        fps = min(240.0, max(24.0, math.ceil(8.0 / min(real))))
+    for cand in (240.0, 180.0, 120.0, 90.0, 60.0, 48.0, 30.0, 24.0, 15.0, 12.0, 10.0):
+        if _estimate(cand) <= KF_BUDGET:
+            fps = cand
+            break
+    else:
+        fps = 10.0
+        log("  !! even 10 fps exceeds the keyframe budget -- this shape may lose "
+            "animation to the Int16 cap in ts_gltf.cpp")
     bpy.context.scene.render.fps = int(fps)
     bpy.context.scene.render.fps_base = 1.0
-    log("sampling at {} fps (shortest sequence {:.3f}s -> {:.0f} frames)".format(
-        int(fps), min(real) if real else 0.0, (min(real) if real else 0) * fps))
+    log("sampling at {} fps -- est. {} keyframes (budget {}, ts_gltf cap 32000)".format(
+        int(fps), _estimate(fps), KF_BUDGET))
+    if shortest > 0.0 and shortest * fps < 2.0:
+        log("  !! shortest sequence {:.3f}s gets only {:.1f} frames at this rate; "
+            "a clip that samples to nothing is DROPPED by Blender and loses its name"
+            .format(shortest, shortest * fps))
     build_nla_tracks(ranges, count_of, dur_of, fps, owned)
     flip_winding_to_gltf_ccw()
     # Strips now start at frame 0, and the exporter bakes each track over its own
@@ -814,6 +873,13 @@ def main():
             # object animations.
             export_optimize_animation_size=False,
             export_optimize_animation_keep_anim_object=True,
+            # Asking for sparse keys rather than baked frames.  ★MEASURED: this has
+            # NO EFFECT in NLA_TRACKS mode -- output was byte-identical.★ NLA
+            # evaluation requires baking, so Blender samples regardless.  Left in
+            # because it is the correct intent and costs nothing, but it does NOT
+            # solve the keyframe-cap problem: see the KF_BUDGET note above and the
+            # SEQUENCE-COUNT CEILING in this file's header.
+            export_force_sampling=False,
         )
     except Exception:
         log("!! EXPORT RAISED:")
