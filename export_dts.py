@@ -460,6 +460,94 @@ def validate_face_winding(packed_verts, faces, mesh_name, auto_fix=True,
     return len(bad), fixed, ambiguous
 
 
+# Clip names a player armor must provide, read off the animData[0..50] table in
+# base\armordata.cs (and identical in every RPG/RMRPG/SWRPG PlayerData block). Slot INDEX is the
+# engine's ANIM_* enum; the string is the sequence name looked up in the shape.
+# Six slots reuse a name with direction = -1 -- there is no "side right" clip, strafing right is
+# "side left" played backwards -- so these clips must read correctly in reverse too.
+PLAYER_CLIPS = [
+    "root", "run", "runback", "side left", "jump stand", "jump run",
+    "crouch root", "crouch forward", "crouch side left",
+    "fall", "landing", "tumble loop", "tumble end", "jet",
+    "PDA access", "throw", "flyer root", "apc root", "apc pilot",
+    "crouch die", "die chest", "die head", "die grab back", "die right side", "die left side",
+    "die leg left", "die leg right", "die blown back", "die spin", "die forward",
+    "die forward kneel", "die back",
+    "sign over here", "sign point", "sign retreat", "sign stop", "sign salut",
+    "celebration 1", "celebration 2", "celebration 3", "taunt 1", "taunt 2",
+    "pose kneel", "pose stand", "wave",
+]
+
+# Not in animData: the engine seeds viewThread with "looks" itself and pins it to view pitch
+# (Player::updateAnimation). "crouch looks" falls back to "looks" when absent.
+PLAYER_CLIPS_ENGINE = ["looks"]
+
+# Names script resolves at runtime on non-player shapes, via GameBase::playSequence(obj, thread,
+# name). "activate" is played BACKWARDS by stations to stow, so it must be authored reversible.
+SCRIPT_CLIPS = ["power", "activate", "use", "deploy", "root"]
+
+# Script threads carry the sequence INDEX on the wire, not the name:
+# writeInt(st.sequence, ThreadSequenceBits) with ThreadSequenceBits = 4 (shapebase.h:21-29).
+MAX_WIRE_SEQUENCE_INDEX = 16
+
+
+def report_sequence_coverage(sequence_ranges, model_name="<model>"):
+    """Print the sequence manifest and flag clips the engine needs but the rig does not have.
+
+    ★This has to happen at export time, because the runtime cannot tell you.★ A name the shape
+    does not provide leaves animIndex[i] == -1, and player.cpp:412-413 then coerces it to 0 --
+    so the slot silently plays sequence 0 (usually idle) forever, with no error, no log line and
+    no visual clue beyond "that animation never happens". Rigs fail this way for years.
+
+    Also prints the ordered manifest, because for non-player shapes the first 16 entries are a
+    WIRE contract: script threads send a 4-bit sequence index, so a re-authored station whose
+    sequence order differs from the stock .dts will animate the wrong thing on a live server.
+    No code can fix that; it has to be caught here.
+
+    Returns a list of human-readable problems (empty if clean).
+    """
+    names = [n for (n, _s, _e) in sequence_ranges]
+    lower = {n.lower() for n in names}
+    problems = []
+
+    print(f"  [SEQ] {model_name}: {len(names)} sequence(s)")
+    for i, n in enumerate(names):
+        mark = ""
+        if i < MAX_WIRE_SEQUENCE_INDEX and n.lower() in (c.lower() for c in SCRIPT_CLIPS):
+            mark = "   <- script-visible, index is a WIRE contract"
+        print(f"  [SEQ]   {i:3d}  {n}{mark}")
+
+    # Player rig? Decided by overlap, so a prop or a weapon is not nagged about death animations.
+    # The bar is deliberately LOW: a weapon or vehicle shares at most one or two names with the
+    # player set, while a genuinely incomplete player rig (the Herc has 5 of 45) is exactly the
+    # case worth shouting about -- and the one a high threshold would let through.
+    overlap = sum(1 for c in PLAYER_CLIPS if c.lower() in lower)
+    if overlap >= 4:
+        missing = [c for c in PLAYER_CLIPS if c.lower() not in lower]
+        missing_engine = [c for c in PLAYER_CLIPS_ENGINE if c.lower() not in lower]
+        if missing:
+            problems.append(f"{len(missing)} player clip(s) missing: {', '.join(missing)}")
+            print(f"  [SEQ] ★{model_name} looks like a player rig and is MISSING "
+                  f"{len(missing)}/{len(PLAYER_CLIPS)} required clips★")
+            for c in missing:
+                print(f"  [SEQ]     missing: '{c}'  -> that slot will silently play sequence 0")
+        if missing_engine:
+            problems.append(f"engine clip(s) missing: {', '.join(missing_engine)}")
+            print(f"  [SEQ] ★missing engine-driven clip(s): {', '.join(missing_engine)} "
+                  f"(viewThread aim pose)★")
+
+    # A script-visible clip past index 15 can never be selected over the wire.
+    for i, n in enumerate(names):
+        if i >= MAX_WIRE_SEQUENCE_INDEX and n.lower() in (c.lower() for c in SCRIPT_CLIPS):
+            problems.append(f"script clip '{n}' sits at index {i} (>= {MAX_WIRE_SEQUENCE_INDEX})")
+            print(f"  [SEQ] ★'{n}' is at index {i}: script threads only carry "
+                  f"{MAX_WIRE_SEQUENCE_INDEX} sequence indices, so it can never be played★")
+
+    if not problems:
+        print(f"  [SEQ] {model_name}: coverage OK")
+    return problems
+
+
 def material_map_file(mat):
     """Texture filename for the DTS material list.
 
@@ -2474,6 +2562,15 @@ class ExportDTS(bpy.types.Operator, ExportHelper):
         if markers and not has_activation:
             # Match original Axe.dts duration (0.433s)
             sequence_ranges.insert(0, ('activation', scene.frame_start, scene.frame_start + 1))
+
+        # Coverage + manifest BEFORE writing anything: a clip the engine wants but the rig lacks
+        # is invisible at runtime (it silently plays sequence 0), and for non-player shapes the
+        # first 16 sequence indices are a wire contract. Export time is the only place to catch it.
+        if sequence_ranges:
+            _seq_problems = report_sequence_coverage(
+                sequence_ranges, os.path.basename(self.filepath))
+            if _seq_problems:
+                self.report({'WARNING'}, "Sequence coverage: " + "; ".join(_seq_problems))
 
         # 1. Create all Sequence headers first
         for seq_idx, (seq_name, start_f, end_f) in enumerate(sequence_ranges):
