@@ -532,6 +532,34 @@ def build_nla_tracks(ranges, owner_counts, durations, fps, owned):
     return animated, strips
 
 
+def set_linear_interpolation():
+    """★DTS INTERPOLATES between keyframes -- LERP for translation, SLERP for
+    rotation★ (docs/darkstar_dts_master_reference.md).  The importer leaves
+    Blender's keys on CONSTANT interpolation, which holds each value and jumps at
+    the next key.  Baking a sparse track then produces stair-steps:
+    dummy_baseA64's X had only 12 distinct values across 321 samples, and since it
+    is the detail-0 root the whole mech jumped between them instead of swaying.
+    Joe: "it moves left and right now ... but it's not smooth, it seems jumpy".
+
+    Note the GLB's sampler already declared LINEAR -- it was faithfully
+    reproducing steps that were baked in, so the format was not the problem.
+
+    Done here rather than in main.py so the shared importer is left alone; this
+    converter is the only consumer that bakes."""
+    total = 0
+    for act in bpy.data.actions:
+        for fc in action_fcurves(act):
+            for kp in fc.keyframe_points:
+                kp.interpolation = 'LINEAR'
+                total += 1
+            try:
+                fc.update()
+            except Exception:
+                pass
+    log("interpolation: {} keyframe(s) set to LINEAR (DTS lerps; Blender defaulted "
+        "to CONSTANT)".format(total))
+
+
 def flip_winding_to_gltf_ccw():
     """DTS front-faces CLOCKWISE (ts_CelAnimMesh.cpp:88-96 keeps a face whose
     screen-space cross is >= 0 in a Y-DOWN space); glTF requires COUNTER-clockwise
@@ -666,6 +694,8 @@ def main():
                 last = max(last, int(kp.co[0]))
     if last > bpy.context.scene.frame_end:
         bpy.context.scene.frame_end = last
+
+    set_linear_interpolation()
 
     ranges = sequence_ranges()
     log("DTS sequences from timeline markers: {}".format(
