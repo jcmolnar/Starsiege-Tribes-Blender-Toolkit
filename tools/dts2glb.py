@@ -66,9 +66,12 @@ Why this is not just "import, then export_scene.gltf":
           plane + uniform rate           83,929     1.24e-03  correct, 2.62x OVER
           objective (shipped)            25,303     3.05e-05  correct, UNDER CAP
 
-      Smaller AND more accurate -- there was no trade.  A note here previously
-      blamed "quaternion SIGN handling" for the ~1.35 figure; ★that was WRONG★ and
-      the reasons are recorded in _decimate's docstring so nobody re-derives it.
+      Smaller AND more accurate -- there was no trade.  ★Two explanations for the
+      proxies' failure were recorded here and BOTH were refuted by measurement (a
+      quaternion sign bug; an ill-conditioned plane basis).  The real cause was an
+      UNNORMALISED dot product inside the rate test's angle helper.★  Full evidence
+      is in _decimate's docstring -- read it before touching this, because both wrong
+      guesses looked convincing.
 
   ★What the cap actually charges, since it is easy to measure the wrong thing.★
   ts_gltf.cpp:1167-1192 emits one keyframe per entry in the UNION of a node's
@@ -221,11 +224,49 @@ def dts_sequence_owner_counts(path):
     the layout cannot be resolved, in which case the caller keeps every node
     (the old behaviour) rather than guessing.
 
-    Layout per ts_shape.cpp:1073-1103 -- header, then nodes, sequences,
-    subsequences.  v7 uses Int32 fields (Node 5x4=20, SubSequence 3x4=12); v8
-    packs them into Int16 (10 and 6).  The sequence record stride is SOLVED for
-    rather than assumed: only the true stride leaves a subsequence table whose
-    every record is in range, which makes the parse self-verifying."""
+    ★FULLY DETERMINISTIC.★  Every table offset is a running sum of the engine's own
+    record sizes -- no stride solving, no scanning for the name table.  Both of those
+    heuristics were WRONG, and measurably so: over an 823-shape corpus (all of
+    Entities.vol + Editor.vol + every loose .dts in base\\ and rpg\\) the old code
+    mis-parsed 228 shapes, handing 207 of them GARBAGE SEQUENCE NAMES.  On
+    mortar_turret.DTS it reported ['?S7>?','?','e','ibility','n'] where the truth is
+    ['fire','visibility','turn','elevate','power'] -- the scan landed 45 bytes early,
+    so every 24-byte record straddled two real names.  That is the same failure class
+    as the crash this whole tool exists to prevent: the engine binds sequences BY
+    NAME, so a garbled name silently binds nothing.
+
+    The stride "solve" was the worse bug conceptually: it searched 8..96 for a value
+    that is a COMPILE-TIME CONSTANT.  Sequence is Int32 x 8 = 32 bytes for every
+    version >= 5 (ts_shape.h:167-184) -- fName, fCyclic, fDuration, fPriority,
+    fFirstFrameTrigger, fNumFrameTriggers, fNumIFLSubSequences, fFirstIFLSubSequence,
+    all 4 bytes.  The search accepted the first stride whose subsequence table merely
+    looked in-range, and returned something other than 32 on 196 of the 505 shapes
+    that have sequences.
+
+    Read order (ts_shape.cpp:1122-1142, no per-vector count prefix):
+        nodes, sequences, subsequences, keyframes, transforms, NAMES, objects,
+        details, transitions, frameTriggers
+    Record sizes, all under #pragma pack(push,4), each verified in the header:
+        Node       v<=7 Int32 x5 = 20 | v8 Int16 x5 = 10        ts_shape.h:214-221
+        Sequence   v>=5 Int32 x8 = 32                           ts_shape.h:167-184
+        SubSeq     v<=7 Int32 x3 = 12 | v8 Int16 x3 = 6         ts_shape.h:186-194
+        Keyframe   v<=7 V7Keyframe RealF+UInt32 x2 = 12         ts_shape.cpp:985-989
+                   v8   Keyframe   RealF+UInt16 x2 = 8          ts_shape.h:127-141
+        Transform  v<7  V6Transform QuatF+Point3F x2 = 40       ts_transform.h:31-37
+                   v==7 V7Transform Quat16+Point3F x2 = 32      ts_transform.h:170-176
+                   v8   Transform   Quat16+Point3F     = 20     ts_transform.h:91-95
+                        (TRANS_USE_SCALE is 0 -- ts_transform.h:20)
+        Name       char[24]                                      ts_types.h MaxNameSize
+
+    Still self-verifying, just on the RESULT instead of on the offsets: the name table
+    must fit the file, every node's and sequence's name index must be in range, the
+    resolved names must look like names, and every node->subsequence->sequence index
+    must be in range.  On the 823-shape corpus that passes 823/823 (the scan passed
+    615/823).  Returns None on any failure, so the caller falls back to keeping every
+    node rather than acting on a bad parse.
+
+    Versions below 5 are refused rather than guessed -- v4 and v3 read
+    oldSequencesV4/V3 with different record layouts (ts_shape.cpp:1125-1129)."""
     try:
         data = open(path, 'rb').read()
         i = data.find(b"TS::Shape")
@@ -243,127 +284,91 @@ def dts_sequence_owner_counts(path):
         if version > 7:
             o += 24                             # bounds box (v8+)
 
+        if version < 5:
+            log("  !! DTS version {} predates the v5 record layout -- refusing to guess"
+                .format(version))
+            return None
+
         if version <= 7:
             node_rec, sub_rec, node_fmt, sub_fmt = 20, 12, "<5i", "<3i"
         else:
             node_rec, sub_rec, node_fmt, sub_fmt = 10, 6, "<5h", "<3h"
+        kf_rec = 12 if version <= 7 else 8
+        xf_rec = 40 if version < 7 else (32 if version == 7 else 20)
+        SEQ_REC = 32                    # Int32 x 8, every version >= 5
 
-        nodes = [struct.unpack_from(node_fmt, data, o + k * node_rec)
-                 for k in range(nNodes)]
-        seq_off = o + nNodes * node_rec
+        node_off = o
+        seq_off = node_off + nNodes * node_rec
+        ss_off = seq_off + nSeq * SEQ_REC
+        kf_off = ss_off + nSubSeq * sub_rec
+        xf_off = kf_off + nKeyframes * kf_rec
+        name_off = xf_off + nTransforms * xf_rec
 
-        best = None
-        for stride in range(8, 96, 2):
-            ss_off = seq_off + nSeq * stride
-            if ss_off + nSubSeq * sub_rec > len(data):
-                continue
-            ok = True
-            for k in range(nSubSeq):
-                si, nk, fk = struct.unpack_from(sub_fmt, data, ss_off + k * sub_rec)
-                if not (0 <= si < nSeq and 0 <= nk <= nKeyframes
-                        and 0 <= fk <= nKeyframes and fk + nk <= nKeyframes):
-                    ok = False
-                    break
-            if ok:
-                best = stride
-                break
-        if best is None:
+        if name_off + nNames * 24 > len(data):
+            log("  !! computed name table runs past EOF ({} > {}) -- layout not "
+                "understood, keeping every node".format(name_off + nNames * 24, len(data)))
             return None
 
-        ss_off = seq_off + nSeq * best
+        nodes = [struct.unpack_from(node_fmt, data, node_off + k * node_rec)
+                 for k in range(nNodes)]
         subs = [struct.unpack_from(sub_fmt, data, ss_off + k * sub_rec)
                 for k in range(nSubSeq)]
+        names = [data[name_off + 24 * k:name_off + 24 * k + 24].split(b"\x00")[0]
+                 .decode("latin1") for k in range(nNames)]
+
+        # ---- verify the RESULT (the offsets are not in question; the file might be)
+        def _namelike(s):
+            return len(s) >= 1 and any(c.isalnum() for c in s) and \
+                all(32 <= ord(c) <= 126 for c in s)
+
+        for (nmIdx, _p, _ns, _fs, _dt) in nodes:
+            if not (0 <= nmIdx < nNames) or not _namelike(names[nmIdx]):
+                log("  !! node name index {} does not resolve to a name -- keeping "
+                    "every node".format(nmIdx))
+                return None
+        for k in range(nSubSeq):
+            si, nk, fk = subs[k]
+            if not (0 <= si < nSeq and 0 <= nk <= nKeyframes
+                    and 0 <= fk <= nKeyframes and fk + nk <= nKeyframes):
+                log("  !! subsequence {} out of range (seq {}, keys {}+{} of {}) -- "
+                    "keeping every node".format(k, si, fk, nk, nKeyframes))
+                return None
+
         counts = [0] * nSeq
         for (_nm, _par, nsub, firstsub, _dt) in nodes:
             for k in range(firstsub, firstsub + nsub):
                 if 0 <= k < nSubSeq:
                     counts[subs[k][0]] += 1
 
-        # fDuration is the 3rd field of a Sequence: fName, fCyclic, fDuration,
-        # fPriority, fFirstFrameTrigger, fNumFrameTriggers, fNumIFLSubSequences,
-        # fFirstIFLSubSequence (ts_shape.h:167-184) -- 8 x 4 bytes at v7, which is
-        # exactly the 32-byte stride solved for above.
+        # fDuration is the 3rd field of a Sequence (ts_shape.h:167-184), so 8 bytes in.
         durations = [0.0] * nSeq
         for s in range(nSeq):
-            try:
-                durations[s] = struct.unpack_from("<f", data, seq_off + s * best + 8)[0]
-            except Exception:
-                durations[s] = 0.0
+            durations[s] = struct.unpack_from("<f", data, seq_off + s * SEQ_REC + 8)[0]
 
-        # Recover the 24-byte name table so ownership can be keyed by NODE NAME, not
-        # just counted.  Located by scanning for a run of nNames clean records --
-        # self-verifying, like the stride solve above.  This is what makes EXACT
-        # per-(node, sequence) gating possible; counting alone forced "this sequence
-        # drives 47 of 48 nodes, keep them all", and that one extra node was
-        # 'bounds', which owns neither 'root' nor 'looks'.  Giving it a 'root' track
-        # pinned it to -29.821 during idle and made entering the walk snap it 29
-        # units -- a visible shift at exactly the idle<->walk transitions.
-        # ★Locate the 24-byte name table -- and VALIDATE the candidate.★
-        #
-        # A "printable ASCII, NUL-terminated" test alone is not enough: a run of
-        # spaces passes it.  On rpgmalehuman.dts that matched a decoy region and
-        # every node name came back as ' ' or '!', so the ownership set matched
-        # nothing and EVERY sequence got zero strips.  (The name check caught it --
-        # 43 names lost, hard fail -- but a decoy could in principle yield a
-        # plausible-but-wrong map, so validate rather than trust the first hit.)
-        #
-        # The validation that actually discriminates: resolve the names the NODES
-        # reference and require them to look like node names -- 2+ chars, containing
-        # a letter or digit, and mostly distinct.  Real node tables pass easily;
-        # runs of filler do not.
-        def _clean(rec):
-            z = rec.find(b"\x00")
-            if z < 1:
-                return False
-            for c in rec[:z]:
-                ch = c if isinstance(c, int) else ord(c)
-                if ch < 32 or ch > 126:
-                    return False
-            return True
-
-        def _plausible(cand):
-            resolved = []
-            for (nmIdx, _p, _ns, _fs, _dt) in nodes:
-                if not (0 <= nmIdx < nNames):
-                    return None
-                s = cand[nmIdx]
-                if len(s) < 2 or not any(c.isalnum() for c in s):
-                    return None
-                resolved.append(s)
-            if len(set(resolved)) < max(2, int(len(resolved) * 0.5)):
-                return None            # a real table does not name half the nodes alike
-            return resolved
-
-        names = None
-        found_at = -1
-        start = o
-        limit = len(data) - nNames * 24
-        while start < limit:
-            ok = True
-            for k in range(nNames):
-                if not _clean(data[start + k * 24:start + k * 24 + 24]):
-                    ok = False
-                    break
-            if ok:
-                cand = [data[start + k * 24:start + k * 24 + 24].split(b"\x00")[0]
-                        .decode("ascii", "replace") for k in range(nNames)]
-                if _plausible(cand) is not None:
-                    names = cand
-                    found_at = start
-                    break
-            start += 1
-
-        owned = None
+        # The name table is what makes EXACT per-(node, sequence) gating possible;
+        # counting alone forced "this sequence drives 47 of 48 nodes, keep them all",
+        # and that one extra node was 'bounds', which owns neither 'root' nor 'looks'.
+        # Giving it a 'root' track pinned it to -29.821 during idle and made entering
+        # the walk snap it 29 units -- a visible shift at exactly the idle<->walk
+        # transitions.
         seq_names = None
-        if names is not None:
-            # Sequence::fName is the first field of the record whose stride was
-            # solved above, so ownership and durations can be keyed by NAME.  That
-            # matters: keying by marker INDEX assumes every sequence has a timeline
-            # marker, and rpgmalehuman has 44 sequences but only 43 markers -- one
-            # unmarked sequence shifts every index after it.
+        owned = None
+        seq_ok = True
+        for s in range(nSeq):
+            ni = struct.unpack_from("<i", data, seq_off + s * SEQ_REC)[0]
+            if not (0 <= ni < nNames) or not _namelike(names[ni]):
+                log("  !! sequence {} name index {} does not resolve -- falling back "
+                    "to per-sequence counts".format(s, ni))
+                seq_ok = False
+                break
+        if seq_ok:
+            # Sequence::fName is the record's first field, so ownership and durations
+            # can be keyed by NAME.  That matters: keying by marker INDEX assumes every
+            # sequence has a timeline marker, and rpgmalehuman has 44 sequences but only
+            # 43 markers -- one unmarked sequence shifts every index after it.
             seq_names = []
             for s in range(nSeq):
-                ni = struct.unpack_from("<i", data, seq_off + s * best)[0]
+                ni = struct.unpack_from("<i", data, seq_off + s * SEQ_REC)[0]
                 seq_names.append(names[ni] if 0 <= ni < nNames else "seq%d" % s)
             owned = set()
             for (nmIdx, _par, nsub, firstsub, _dt) in nodes:
@@ -372,8 +377,8 @@ def dts_sequence_owner_counts(path):
                         si = subs[k][0]
                         if 0 <= si < nSeq:
                             owned.add((names[nmIdx], seq_names[si]))
-            log("DTS name table validated at 0x{:X} -- exact per-node ownership, keyed by name"
-                .format(found_at))
+            log("DTS name table at 0x{:X} (computed) -- exact per-node ownership, keyed by name"
+                .format(name_off))
             # Duplicate sequence names COLLAPSE: markers are keyed by name and glTF
             # merges same-named tracks, so N sequences become N-distinct animations.
             # rpgmalehuman.dts has two called 'wave' (44 sequences, 43 names).
@@ -387,12 +392,12 @@ def dts_sequence_owner_counts(path):
                     "NOT fine for a station/vehicle, where index 0..15 is contracted."
                     .format(dupes, nSeq, len(set(seq_names))))
         else:
-            log("  !! no name table passed validation -- falling back to per-sequence "
+            log("  !! sequence names did not resolve -- falling back to per-sequence "
                 "counts, so a partially-owned sequence keeps every node")
 
-        log("DTS v{}: {} node(s), {} sequence(s), sequence stride {} bytes "
-            "(subsequence table validates for all {} records)".format(
-                version, nNodes, nSeq, best, nSubSeq))
+        log("DTS v{}: {} node(s), {} sequence(s), {} subsequence(s), {} keyframe(s), "
+            "{} transform(s), {} name(s) -- all offsets computed, all indices in range"
+            .format(version, nNodes, nSeq, nSubSeq, nKeyframes, nTransforms, nNames))
         return counts, durations, owned, seq_names
     except Exception as e:
         log("  !! could not read sequence ownership from the .dts: {}".format(e))
@@ -862,26 +867,42 @@ def _decimate(times, vals, tol, rotation):
     So the objective test is simultaneously 3.3x smaller and 40x more accurate than
     the best proxy.  Nothing was traded away.
 
-    ★Why the proxies failed, measured -- do not re-derive.★  In-plane is NECESSARY
-    but NOT SUFFICIENT (a rotation that speeds up about one axis stays in its plane
-    while being nothing like a single slerp), and worse, the plane's basis was built
-    by Gram-Schmidt from two ADJACENT samples.  Blender bakes at a high rate, so
-    adjacent quaternions are nearly identical, the orthogonal residual is a tiny
-    difference vector, and normalising it amplifies float noise into an essentially
-    arbitrary direction -- the "plane" was often not the arc's plane at all.  Only
-    the scalar uniform-rate test was actually holding correctness, and requiring a
-    UNIFORM rate is stricter than the geometry needs: Blender normalises quaternions
-    on evaluation, so the baked path is nlerp -- the same great-circle arc slerp
-    takes, but traversed at a non-uniform rate.  Cutting on rate therefore cut arcs
-    that slerp reproduces perfectly, which is exactly the 3.3x.
+    ★Why the proxies failed -- MEASURED, after two wrong guesses.  Do not re-derive.★
 
-    ★An earlier note here blamed "quaternion SIGN handling" because the loose-metric
-    error landed near sqrt(2).  That was WRONG.★  Sign is handled correctly in all
-    three places that matter: QuatF::interpolate negates q2 when cosOmega < 0
-    (m_quat.cpp:259-265), _slerp below does the same, and the error metric compares
-    both +q and -q.  ~1.35 is simply the scale of the deviation between unrelated
-    unit quaternions -- the signature of a segment extended far past where it should
-    have been cut, not of a sign bug.
+    The over-keying had a single numerical cause: the old rate test's helper
+    _quat_angle computed acos of the RAW dot of two float32 quaternions, without
+    normalising them.  Blender's exported quaternions carry |1-|q|| up to 1.9e-07, and
+    since d = |a||b|cos(phi) the angle error is amplified by 1/sin(phi) -- at a 240 fps
+    bake phi is about 1.4e-03, so 1e-07 of magnitude error becomes ~1e-04 rad, which
+    IS ANG_TOL.  Measured on the raw baked human: the raw |dot| EXCEEDS 1.0 on 8.9% of
+    adjacent pairs (20,252 of 227,264), where the clamp fires and the angle is reported
+    as EXACTLY ZERO; against an exact chord reference the shipped angle was wrong by
+    more than the whole tolerance on 23.4% of pairs, versus 0.0000% once normalised.
+    The rate test caused 92.3% of all cuts, so the metric was very largely cutting on
+    float noise rather than geometry.  Just normalising takes it to 29,193 keyframes /
+    8.08e-04 -- which passes; the objective metric below is simply better still
+    (24,571 / 1.00e-04) and cannot regress this way, because its accept test is the
+    error itself and it normalises up front.
+
+    ★TWO HYPOTHESES THIS FILE PREVIOUSLY RECORDED, BOTH REFUTED BY MEASUREMENT:★
+      1. "quaternion SIGN handling, because the error lands near sqrt(2)".  No: sign is
+         handled in all three places that matter -- QuatF::interpolate negates q2 when
+         cosOmega < 0 (m_quat.cpp:259-265), _slerp below does the same, and the error
+         metric compares both +q and -q.
+      2. "the plane's Gram-Schmidt basis is ill-conditioned because it is built from two
+         nearly identical adjacent samples, so the plane is float noise".  No.  The
+         residual nr has median 1.4e-03, an order of magnitude above the supposed noise
+         scale, and only 3.8% of evaluated pairs fall in the (1e-9, 1e-4) band.  An SVD
+         of the accepted segments puts their TRUE out-of-plane extent at median 2.7e-08
+         (max 1.0e-05, tol 3.05e-05) -- the planes accepted were the arc's real planes.
+         Rebuilding the basis from a WELL-SEPARATED pair rejects no more segments
+         (5/592 vs 3/592).  The mechanism was self-defeating anyway: an arbitrary bn
+         makes the residual LARGER, so it would cut earlier and keep MORE keys, while
+         plane-only measurably keeps FEWER.
+      What the ~1.35 error actually is: the correct great circle traversed to the WRONG
+      EXTENT.  The samples are coplanar, but the short-arc slerp between the segment's
+      endpoints cannot reach them because the true sweep is large (rate deviation up to
+      3.13 rad).  In-plane is NECESSARY but NOT SUFFICIENT -- that part was always right.
 
     Schedule: from each kept key, exponentially probe outward while the segment still
     fits, then binary-search the boundary between the last good end and the first bad
@@ -1077,12 +1098,19 @@ def decimate_glb_animations(path):
             times = [t[0] for t in ts]
             is_rot = (accs[ao]['type'] == 'VEC4' and rot_sampler.get(id(s), False))
             if is_rot:
-                # Normalise before fitting: _slerp renormalises its result, so
-                # comparing it against a non-unit sample would charge the fit for the
-                # length difference rather than the pose difference.  glTF requires
-                # rotation quaternions to be unit anyway (spec 3.7.3.2 / 5.24), and
-                # ts_gltf hands them straight to QuatF::interpolate, so writing the
-                # normalised values back is both safe and more correct.
+                # ★Normalise before fitting -- this line is LOAD-BEARING, not hygiene.★
+                # Blender's exported quaternions carry |1-|q|| up to 1.9e-07, and the
+                # raw dot of two adjacent ones EXCEEDS 1.0 on 8.9% of pairs (measured:
+                # 20,252 of 227,264 on the baked human).  Any acos/slerp fed those
+                # clamps, and the previous metric's angle helper reported such pairs as
+                # EXACTLY ZERO degrees apart -- which is what made it cut on noise.
+                # Normalising here is what keeps that entire failure class out.
+                # _slerp also renormalises its result, so comparing it against a
+                # non-unit sample would otherwise charge the fit for the LENGTH
+                # difference rather than the pose difference.  glTF requires unit
+                # rotation quaternions anyway (spec 3.7.3.2 / 5.24) and ts_gltf hands
+                # them straight to QuatF::interpolate, so writing the normalised values
+                # back is both safe and more correct.
                 vs = [tuple(_qnorm(v)) for v in vs]
             keep = _decimate(times, vs, EPS_ROT if is_rot else EPS_LIN, is_rot)
             before += len(times)
