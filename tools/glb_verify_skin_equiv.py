@@ -143,10 +143,27 @@ def main(rigid_path, skinned_path):
                 at = prim['attributes']
                 pos = sread(at['POSITION'])
                 jt = sread(at['JOINTS_0'])
+                wt = sread(at['WEIGHTS_0'])
+                # ★Sum ALL FOUR influences.★  An earlier version read only
+                # JOINTS_0[k][0] and ignored the weights, which silently reduced every
+                # comparison to the single-influence case -- so a genuinely BLENDED
+                # asset measured as identical to rigid and looked like a no-op.  A
+                # verifier that cannot see the thing under test reports success.
                 for k in range(len(pos)):
-                    j = jt[k][0]
-                    pal = m_mul(sworld[joints[j]], list(ibm[j]))
-                    skin_pts.append(xform_point(pal, pos[k]))
+                    acc = [0.0, 0.0, 0.0]
+                    wsum = 0.0
+                    for c in range(4):
+                        w = wt[k][c]
+                        if w <= 0.0:
+                            continue
+                        pal = m_mul(sworld[joints[jt[k][c]]], list(ibm[jt[k][c]]))
+                        q = xform_point(pal, pos[k])
+                        for e in range(3):
+                            acc[e] += w * q[e]
+                        wsum += w
+                    if wsum > 1e-6 and abs(wsum - 1.0) > 1e-4:
+                        acc = [a / wsum for a in acc]
+                    skin_pts.append(tuple(acc))
 
             if len(rigid_pts) != len(skin_pts):
                 print("  anim %d t=%.3f  COUNT MISMATCH %d vs %d"
