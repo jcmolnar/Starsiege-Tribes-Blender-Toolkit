@@ -1435,6 +1435,30 @@ class ImportDTS(bpy.types.Operator, ImportHelper):
                     # Find the node with a sequence that corresponds to it
                     node_id = 0
                     last_subseq_len = 0
+
+                    # The sequence occupies ONE timeline span, set by the longest node
+                    # subsequence.  Nodes with fewer keys still cover that whole span --
+                    # each DTS keyframe carries a fractional position within the
+                    # sequence -- so their keys must be PLACED BY POSITION, not packed
+                    # consecutively from the start.
+                    #
+                    # Packing them was a real bug: in tr_talon's 'run' the legs carry 43
+                    # keyframes and bounds/cam/coll0/dummy_base* carry 9, over a 43-frame
+                    # span.  So the legs walked correctly while the root node finished
+                    # moving in the first 9 frames and then held for 34 -- a lurch at the
+                    # start of every cycle and a snap at the end.  This importer already
+                    # honours kf.position for UV frames, visibility and shape keys
+                    # (see below); node transforms were the one track type left out.
+                    seq_span = 0
+                    for _n in nodes:
+                        if _n.num_subsequences:
+                            for _sc in range(_n.num_subsequences):
+                                _ss = subsequences[_n.first_subsequence + _sc]
+                                if _ss.sequence_index == seq_id and _ss.num_keyframes > seq_span:
+                                    seq_span = _ss.num_keyframes
+                    max_subseq_len = seq_span
+                    seq_span = max(0, seq_span - 1)
+
                     for node in nodes:
                         if node.num_subsequences:
 
@@ -1451,15 +1475,30 @@ class ImportDTS(bpy.types.Operator, ImportHelper):
                                     # Actions will be created for each object animated. Bones will need to be created to be used with armors.
                                     #object.animation_data_create() #
                                     #object.animation_data.action = bpy.data.actions.new(name=seq_name) #
-                                    for key in range(first_keyframe, first_keyframe + subseq.num_keyframes):
+                                    # Honour each key's fractional position across the
+                                    # sequence span; fall back to sequential when the
+                                    # positions are absent or all zero, the same way the
+                                    # shape-key track below does.
+                                    _keys = range(first_keyframe,
+                                                  first_keyframe + subseq.num_keyframes)
+                                    _pos = [getattr(keyframes[k], 'position', 0.0) or 0.0
+                                            for k in _keys]
+                                    _use_pos = (seq_span > 0 and subseq.num_keyframes > 1
+                                                and max(_pos) > 0.0)
+                                    for _i, key in enumerate(_keys):
                                         trans = transforms[keyframes[key].key_value]
+                                        if _use_pos:
+                                            blender_frame = frame_id + int(round(_pos[_i] * seq_span))
                                         scene.frame_set(blender_frame) #Blender
                                         object.location = [trans.translate.x, trans.translate.y, trans.translate.z]
                                         object.rotation_quaternion = [short2float(trans.rotate.w) * -1, short2float(trans.rotate.x), short2float(trans.rotate.y), short2float(trans.rotate.z)] #Blender
                                         object.keyframe_insert(data_path="rotation_quaternion", index=-1)
                                         object.keyframe_insert(data_path="location", index=-1)
-                                        blender_frame += 1 #Blender
-                                    last_subseq_len = subseq.num_keyframes
+                                        if not _use_pos:
+                                            blender_frame += 1 #Blender
+                                    # Advance by the sequence's own span, not by whichever
+                                    # node happened to be processed last.
+                                    last_subseq_len = max_subseq_len
 
                         node_id += 1
 
