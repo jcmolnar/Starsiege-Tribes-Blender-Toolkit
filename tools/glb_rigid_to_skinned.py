@@ -282,7 +282,7 @@ def render_detail_subtree(js):
     return root, subtree
 
 
-def convert(src, dst, verify=False):
+def convert(src, dst, verify=False, mode='rigid', radius=1.5):
     js, binc = load_glb(src)
     read = make_reader(js, binc)
     nodes = js.get('nodes', [])
@@ -292,6 +292,10 @@ def convert(src, dst, verify=False):
 
     world, roots = world_transforms(js)
     detail_root, detail_subtree = render_detail_subtree(js)
+    parent_of = {}
+    for _i, _n in enumerate(nodes):
+        for _c in _n.get('children', []):
+            parent_of[_c] = _i
 
     # Joints = every node.  Keeping the whole tree means the skeleton, its names and
     # the animations stay exactly as they were; only the mesh binding changes.
@@ -382,11 +386,41 @@ def convert(src, dst, verify=False):
             if uv:
                 newp['attributes']['TEXCOORD_0'] = emit(
                     [(u[0], u[1]) for u in uv], 5126, 'VEC2')
-            # one influence, weight 1 -- the rigid binding, expressed as skinning
-            newp['attributes']['JOINTS_0'] = emit(
-                [(jidx, 0, 0, 0)] * len(spos), 5123, 'VEC4')
-            newp['attributes']['WEIGHTS_0'] = emit(
-                [(1.0, 0.0, 0.0, 0.0)] * len(spos), 5126, 'VEC4')
+            # ---- influences ---------------------------------------------------
+            if mode == 'split':
+                # ★Same joint listed FOUR times at 0.25 each.★  Exercises the engine's
+                # multi-influence accumulation -- the loop over MaxInfluences, the
+                # weight sum and the normalisation, none of which the weight-1.0 build
+                # ever ran -- while the expected output stays EXACTLY the weight-1.0
+                # result.  So the pass criterion is still identity rather than
+                # judgement: 0.25+0.25+0.25+0.25 of the same transform is that
+                # transform.  Any difference is the accumulation loop.
+                jrow, wrow = (jidx, jidx, jidx, jidx), (0.25, 0.25, 0.25, 0.25)
+                newp['attributes']['JOINTS_0'] = emit([jrow] * len(spos), 5123, 'VEC4')
+                newp['attributes']['WEIGHTS_0'] = emit([wrow] * len(spos), 5126, 'VEC4')
+            elif mode == 'blend':
+                # Real two-joint blending: vertices near this joint's pivot share
+                # influence with its PARENT, so the seam bends instead of cracking.
+                pj = parent_of.get(ni)
+                pidx = joint_of.get(pj, jidx) if pj is not None else jidx
+                pivot = (world[ni][12], world[ni][13], world[ni][14])
+                jr, wr = [], []
+                for sp in spos:
+                    d = math.sqrt(sum((sp[c] - pivot[c]) ** 2 for c in range(3)))
+                    # linear falloff: at the pivot the parent takes half, fading to
+                    # nothing at `radius`.  Half rather than all, so the part stays
+                    # anchored to its own joint.
+                    wp = 0.5 * max(0.0, 1.0 - d / radius) if radius > 0 else 0.0
+                    jr.append((jidx, pidx, 0, 0))
+                    wr.append((1.0 - wp, wp, 0.0, 0.0))
+                newp['attributes']['JOINTS_0'] = emit(jr, 5123, 'VEC4')
+                newp['attributes']['WEIGHTS_0'] = emit(wr, 5126, 'VEC4')
+            else:
+                # one influence, weight 1 -- the rigid binding, expressed as skinning
+                newp['attributes']['JOINTS_0'] = emit(
+                    [(jidx, 0, 0, 0)] * len(spos), 5123, 'VEC4')
+                newp['attributes']['WEIGHTS_0'] = emit(
+                    [(1.0, 0.0, 0.0, 0.0)] * len(spos), 5126, 'VEC4')
             if idx is not None:
                 newp['indices'] = emit([(i[0],) for i in idx], 5125, 'SCALAR')
             if 'material' in prim:
@@ -484,7 +518,18 @@ def main():
     args = [a for a in sys.argv[1:] if not a.startswith('--')]
     if len(args) != 2:
         raise SystemExit(__doc__)
-    return convert(args[0], args[1], verify='--verify' in sys.argv)
+    mode = 'rigid'
+    if '--split' in sys.argv:
+        mode = 'split'
+    if '--blend' in sys.argv:
+        mode = 'blend'
+    radius = 1.5
+    for a in sys.argv[1:]:
+        if a.startswith('--radius='):
+            radius = float(a.split('=', 1)[1])
+    log("mode: {}{}".format(mode, "  radius={}".format(radius) if mode == 'blend' else ""))
+    return convert(args[0], args[1], verify='--verify' in sys.argv,
+                   mode=mode, radius=radius)
 
 
 if __name__ == '__main__':
