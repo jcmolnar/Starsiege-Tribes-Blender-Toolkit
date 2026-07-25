@@ -175,6 +175,82 @@ def build_nla_tracks(ranges):
     return animated, strips
 
 
+def flip_winding_to_gltf_ccw():
+    """DTS front-faces CLOCKWISE (ts_CelAnimMesh.cpp:88-96 keeps a face whose
+    screen-space cross is >= 0 in a Y-DOWN space); glTF requires COUNTER-clockwise
+    (spec 3.7.4).  The DTS importer copies face index order verbatim -- it has no
+    winding conversion at all -- so Blender ends up holding CW-outward polygons and
+    the exported glTF violates the spec.  ts_gltf.cpp:753 correctly assumes CCW and
+    swaps vertices 1/2, which makes that a SECOND reversal, and the model renders
+    inside-out: near faces culled, far faces visible through the hole.  Joe's
+    report of the first build was exactly that -- "the back is see-through and I
+    see through it into the front, which is solid and textured".
+
+    MEASURED on the pre-fix tr_talon.glb: 140 of 151 meshes had negative signed
+    volume (CW-outward), total -81.67.  Flip here so the GLB we emit is
+    spec-correct; the loader stays spec-correct for natively-authored glTF, which
+    is the pipeline this whole effort is actually for.
+
+    Safe to flip geometrically: the importer sets no custom split normals, so
+    Blender recomputes them from winding and they come out pointing outward."""
+    import bmesh
+    n = 0
+    for me in bpy.data.meshes:
+        if not me.polygons:
+            continue
+        bm = bmesh.new()
+        bm.from_mesh(me)
+        for f in bm.faces:
+            f.normal_flip()
+        bm.to_mesh(me)
+        bm.free()
+        me.update()
+        n += 1
+    log("winding: flipped {} mesh(es) DTS-CW -> glTF-CCW".format(n))
+
+
+def glb_signed_volume(js, data, bin_off):
+    """Sum the signed volume of every indexed triangle mesh in the GLB.
+    CCW-outward (spec-correct) is POSITIVE.  This is the same measurement the
+    .dts winding validator uses, and it is the only way to catch a winding
+    regression without eyes on the model."""
+    bvs = js.get('bufferViews', [])
+    accs = js.get('accessors', [])
+    fmt_of = {5120: 'b', 5121: 'B', 5122: 'h', 5123: 'H', 5125: 'I', 5126: 'f'}
+    ncomp_of = {'SCALAR': 1, 'VEC2': 2, 'VEC3': 3, 'VEC4': 4}
+
+    def read(ai):
+        a = accs[ai]
+        v = bvs[a['bufferView']]
+        base = bin_off + v.get('byteOffset', 0) + a.get('byteOffset', 0)
+        fmt = fmt_of[a['componentType']]
+        nc = ncomp_of[a['type']]
+        stride = v.get('byteStride') or struct.calcsize(fmt) * nc
+        return [struct.unpack_from('<' + fmt * nc, data, base + i * stride)
+                for i in range(a['count'])]
+
+    total = 0.0
+    pos_n = neg_n = 0
+    for m in js.get('meshes', []):
+        for pr in m.get('primitives', []):
+            if 'POSITION' not in pr.get('attributes', {}) or 'indices' not in pr:
+                continue
+            P = read(pr['attributes']['POSITION'])
+            I = [x[0] for x in read(pr['indices'])]
+            vol = 0.0
+            for k in range(0, len(I) - 2, 3):
+                a, b, c = P[I[k]], P[I[k + 1]], P[I[k + 2]]
+                vol += (a[0] * (b[1] * c[2] - b[2] * c[1])
+                        - a[1] * (b[0] * c[2] - b[2] * c[0])
+                        + a[2] * (b[0] * c[1] - b[1] * c[0])) / 6.0
+            total += vol
+            if vol < 0:
+                neg_n += 1
+            else:
+                pos_n += 1
+    return total, pos_n, neg_n
+
+
 def glb_animation_names(path):
     with open(path, 'rb') as f:
         data = f.read()
@@ -182,16 +258,19 @@ def glb_animation_names(path):
         return None, None
     off = 12
     js = None
+    bin_off = 0
     while off + 8 <= len(data):
         clen, ctype = struct.unpack_from('<I4s', data, off)
         off += 8
         chunk = data[off:off + clen]
-        off += clen
         if ctype == b'JSON':
             js = json.loads(chunk.decode('utf-8'))
+        elif ctype[0:3] == b'BIN':
+            bin_off = off
+        off += clen
     if js is None:
-        return None, None
-    return [a.get('name') for a in js.get('animations', [])], js
+        return None, None, None, 0
+    return [a.get('name') for a in js.get('animations', [])], js, data, bin_off
 
 
 def main():
@@ -240,6 +319,7 @@ def main():
         return 6
 
     build_nla_tracks(ranges)
+    flip_winding_to_gltf_ccw()
 
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     try:
@@ -269,12 +349,21 @@ def main():
         log("!! export produced no file")
         return 5
 
-    names, js = glb_animation_names(dst)
+    names, js, raw, bin_off = glb_animation_names(dst)
     log("---- GLB ----")
     log("  size       : {} bytes".format(os.path.getsize(dst)))
     log("  nodes      : {}".format(len(js.get('nodes', []))))
     log("  meshes     : {}".format(len(js.get('meshes', []))))
     log("  ANIMATIONS : {}  {}".format(len(names or []), names))
+
+    vol, npos, nneg = glb_signed_volume(js, raw, bin_off)
+    log("  winding    : {} CCW-outward / {} CW-outward, total signed volume {:.3f}".format(
+        npos, nneg, vol))
+    if vol < 0 or nneg > npos:
+        log("!! FAIL: geometry is mostly CW-outward, which violates glTF spec 3.7.4.")
+        log("!! ts_gltf.cpp:753 swaps 1/2 assuming CCW, so this renders INSIDE-OUT:")
+        log("!! near faces culled, far faces visible through them.")
+        return 8
 
     # The point of the whole script: sequence names must survive.
     want = set(n for n, _, _ in ranges)
