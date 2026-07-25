@@ -713,6 +713,354 @@ def glb_signed_volume(js, data, bin_off):
     return total, pos_n, neg_n
 
 
+def _decimate_linear(times, vals, eps):
+    """Indices to KEEP so linear interpolation reproduces the curve within eps.
+
+    The source is piecewise linear -- the .dts stores sparse keys and both sides
+    now interpolate LINEARLY -- so a segment can be extended by checking only
+    whether each next sample continues the line through the segment's first two
+    points.  That is O(n) rather than the O(n^2) of re-testing every intermediate,
+    which matters at ~678k samples.  The caller VERIFIES the result by
+    reconstructing, so the assumption is checked rather than trusted."""
+    n = len(times)
+    if n <= 2:
+        return list(range(n))
+    ncomp = len(vals[0])
+    keep = [0]
+    i = 0
+    while i < n - 1:
+        j = i + 1
+        if j >= n - 1:
+            break
+        dt = times[j] - times[i]
+        k = j + 1
+        while k < n:
+            if dt == 0.0:
+                break
+            span = times[k] - times[i]
+            ok = True
+            for c in range(ncomp):
+                pred = vals[i][c] + (vals[j][c] - vals[i][c]) * (span / dt)
+                if abs(pred - vals[k][c]) > eps:
+                    ok = False
+                    break
+            if not ok:
+                break
+            k += 1
+        keep.append(k - 1)
+        i = k - 1
+    if keep[-1] != n - 1:
+        keep.append(n - 1)
+    return keep
+
+
+def _quat_angle(a, b):
+    d = abs(sum(a[c] * b[c] for c in range(4)))
+    return 2.0 * math.acos(max(-1.0, min(1.0, d)))
+
+
+def _decimate_slerp(times, vals, tol):
+    """Indices to keep for a ROTATION channel.
+
+    ★glTF LINEAR on quaternions is SPHERICAL, not component-linear★ (spec 3.6.2.3;
+    ts_gltf.cpp:1176 slerps with the engine's own QuatF::interpolate).  So a baked
+    slerp arc cannot be thinned by a straight-line test -- its samples sit off the
+    chord by design, and measuring against the chord kept 123 keys per track where
+    the .dts holds 13.  That single wrong metric was the whole reason component-wise
+    decimation only reached 8.8x instead of the ~78x available.
+
+    A slerp arc lies in the 2-plane spanned by its endpoints, so extend a segment
+    while every sample stays in the plane of its first two.  O(n), and the caller
+    verifies the result by reconstructing with real slerp."""
+    n = len(vals)
+    if n <= 2:
+        return list(range(n))
+    keep = [0]
+    i = 0
+    while i < n - 1:
+        j = i + 1
+        if j >= n - 1:
+            break
+        a = vals[i]
+        na = math.sqrt(sum(x * x for x in a)) or 1.0
+        an = [x / na for x in a]
+        b = vals[j]
+        d = sum(an[c] * b[c] for c in range(4))
+        r = [b[c] - an[c] * d for c in range(4)]
+        nr = math.sqrt(sum(x * x for x in r))
+        k = j + 1
+        if nr < 1e-9:
+            # second key is parallel to the first: constant pose, extend while equal
+            while k < n and max(abs(vals[k][c] - a[c]) for c in range(4)) <= tol:
+                k += 1
+        else:
+            bn = [x / nr for x in r]
+            # In-plane is NECESSARY but NOT SUFFICIENT: a rotation that speeds up or
+            # slows down about one axis stays in its plane while being nothing like a
+            # single uniform slerp.  Trusting the plane test alone gave a max
+            # reconstruction error of 1.39 on components bounded to [-1,1] -- visibly
+            # broken poses that still passed the keyframe cap.  So also require the
+            # swept angle to grow in proportion to time, which is what makes the arc
+            # a single slerp segment.
+            step_ang = _quat_angle(a, b)
+            step_dt = times[j] - times[i]
+            while k < n:
+                q = vals[k]
+                ca = sum(q[c] * an[c] for c in range(4))
+                cb = sum(q[c] * bn[c] for c in range(4))
+                off = max(abs(q[c] - (an[c] * ca + bn[c] * cb)) for c in range(4))
+                if off > tol:
+                    break
+                if step_dt > 0.0:
+                    want = step_ang * ((times[k] - times[i]) / step_dt)
+                    if abs(_quat_angle(a, q) - want) > 1e-3:
+                        break
+                k += 1
+        keep.append(k - 1)
+        i = k - 1
+    if keep[-1] != n - 1:
+        keep.append(n - 1)
+    return keep
+
+
+def _slerp(a, b, t):
+    d = sum(a[c] * b[c] for c in range(4))
+    if d < 0.0:
+        b = [-x for x in b]
+        d = -d
+    if d > 0.9995:
+        r = [a[c] + (b[c] - a[c]) * t for c in range(4)]
+    else:
+        th = math.acos(max(-1.0, min(1.0, d)))
+        s = math.sin(th)
+        w1 = math.sin((1.0 - t) * th) / s
+        w2 = math.sin(t * th) / s
+        r = [a[c] * w1 + b[c] * w2 for c in range(4)]
+    n = math.sqrt(sum(x * x for x in r)) or 1.0
+    return [x / n for x in r]
+
+
+def _reconstruct_error(times, vals, keep, rotation=False):
+    """Max abs deviation when the kept keys are linearly re-sampled at every
+    original time.  This is the number that justifies calling it lossless."""
+    worst = 0.0
+    ncomp = len(vals[0])
+    ki = 0
+    for idx in range(len(times)):
+        while ki + 1 < len(keep) - 1 and keep[ki + 1] < idx:
+            ki += 1
+        a, b = keep[ki], keep[min(ki + 1, len(keep) - 1)]
+        span = times[b] - times[a]
+        f = 0.0 if span == 0 else (times[idx] - times[a]) / span
+        if rotation:
+            q = _slerp(vals[a], vals[b], f)
+            # q and -q are the same rotation, so compare the closer representation
+            e1 = max(abs(q[c] - vals[idx][c]) for c in range(4))
+            e2 = max(abs(-q[c] - vals[idx][c]) for c in range(4))
+            worst = max(worst, min(e1, e2))
+        else:
+            for c in range(ncomp):
+                pred = vals[a][c] + (vals[b][c] - vals[a][c]) * f
+                worst = max(worst, abs(pred - vals[idx][c]))
+    return worst
+
+
+def decimate_glb_animations(path):
+    """Drop every animation keyframe that linear interpolation already reproduces.
+
+    ★Why this exists.★ ts_gltf builds one TS::Shape keyframe AND one transform per
+    sampled time, per (node, sequence), against Int16 caps (MaxKeyframes 32000).
+    Blender's NLA export always BAKES -- export_force_sampling=False is ignored in
+    NLA_TRACKS mode -- so a rate high enough to keep a 0.033s clip alive produced
+    678,946 keyframes on rpgmalehuman, 21x the cap, and the loader would have
+    silently dropped most of the animation.  Sampling down instead wrecks duration
+    fidelity (run 0.600s vs the authored 0.667s at the 10 fps the budget allowed).
+
+    So: bake HIGH, then remove the redundancy.  Because the source is piecewise
+    linear this is lossless to float noise, and the reported max error proves it.
+
+    Rotation tolerance is one Quat16 LSB (1/32767): the engine stores node
+    rotations quantised to 16 bits per component (docs: Quat16), so anything below
+    that cannot survive into the shape anyway.
+    """
+    EPS_ROT = 1.0 / 32767.0
+    EPS_LIN = 1e-4
+
+    with open(path, 'rb') as f:
+        data = f.read()
+    if data[0:4] != b'glTF':
+        log("  !! not a GLB, skipping decimation")
+        return
+    off = 12
+    js = None
+    bin_bytes = b''
+    while off + 8 <= len(data):
+        clen, ctype = struct.unpack_from('<I4s', data, off)
+        off += 8
+        chunk = data[off:off + clen]
+        off += clen
+        if ctype == b'JSON':
+            js = json.loads(chunk.decode('utf-8'))
+        elif ctype[0:3] == b'BIN':
+            bin_bytes = chunk
+    if js is None or not js.get('animations'):
+        return
+
+    accs = js.get('accessors', [])
+    bvs = js.get('bufferViews', [])
+    CFMT = {5120: 'b', 5121: 'B', 5122: 'h', 5123: 'H', 5125: 'I', 5126: 'f'}
+    NC = {'SCALAR': 1, 'VEC2': 2, 'VEC3': 3, 'VEC4': 4}
+
+    # Bail out rather than corrupt anything if the file uses a feature this pass
+    # does not model.  (Verified absent on both test shapes: no sparse accessors,
+    # no byteStride, no matrix types, one accessor per bufferView.)
+    for a in accs:
+        if 'sparse' in a or a['type'] not in NC or a['componentType'] not in CFMT:
+            log("  !! decimation skipped: unsupported accessor layout")
+            return
+
+    def read_acc(ai):
+        a = accs[ai]
+        v = bvs[a['bufferView']]
+        base = v.get('byteOffset', 0) + a.get('byteOffset', 0)
+        nc = NC[a['type']]
+        f = CFMT[a['componentType']]
+        stride = v.get('byteStride') or struct.calcsize(f) * nc
+        return [struct.unpack_from('<' + f * nc, bin_bytes, base + i * stride)
+                for i in range(a['count'])]
+
+    # Decimate each sampler INDEPENDENTLY, and give it its own time accessor.
+    # ★Blender shares one input accessor across every channel of an animation★, so
+    # patching accessors in place is impossible: each channel thins differently.
+    # Emitting fresh accessors per sampler is what makes this work at all -- the
+    # first attempt guarded against shared accessors and therefore skipped every
+    # single sampler ("decimation: nothing to remove").
+    # A sampler only knows it drives rotation via the channel that references it.
+    rot_sampler = {}
+    for a in js['animations']:
+        for ch in a.get('channels', []):
+            if ch.get('target', {}).get('path') == 'rotation':
+                rot_sampler[id(a['samplers'][ch['sampler']])] = True
+
+    new_for = {}           # id(sampler) -> (times list, values list)
+    before = after = 0
+    worst = 0.0
+    for a in js['animations']:
+        for s in a.get('samplers', []):
+            if s.get('interpolation', 'LINEAR') != 'LINEAR':
+                continue
+            ai, ao = s['input'], s['output']
+            if 'bufferView' not in accs[ai] or 'bufferView' not in accs[ao]:
+                continue
+            ts = read_acc(ai)
+            vs = read_acc(ao)
+            if len(ts) != len(vs) or len(ts) < 3:
+                continue
+            times = [t[0] for t in ts]
+            is_rot = (accs[ao]['type'] == 'VEC4' and rot_sampler.get(id(s), False))
+            if is_rot:
+                keep = _decimate_slerp(times, vs, EPS_ROT)
+            else:
+                keep = _decimate_linear(times, vs, EPS_LIN)
+            before += len(times)
+            after += len(keep)
+            if len(keep) < len(times):
+                worst = max(worst, _reconstruct_error(times, vs, keep, is_rot))
+            new_for[id(s)] = ([times[k] for k in keep], [vs[k] for k in keep])
+
+    if not new_for:
+        log("decimation: nothing to remove")
+        return
+
+    # Rebuild accessors + views + binary from scratch.  Every accessor gets its own
+    # tightly packed view, which also drops the now-unreferenced original animation
+    # data instead of leaving 10 MB of it stranded in the file.
+    new_bin = bytearray()
+    new_accs = []
+    new_views = []
+
+    def emit(rows, ctype, gtype, target=None):
+        nonlocal new_bin
+        while len(new_bin) % 4:
+            new_bin.append(0)
+        start = len(new_bin)
+        f = CFMT[ctype]
+        nc = NC[gtype]
+        for r in rows:
+            new_bin += struct.pack('<' + f * nc, *r)
+        nv = {'buffer': 0, 'byteOffset': start, 'byteLength': len(new_bin) - start}
+        if target is not None:
+            nv['target'] = target
+        new_views.append(nv)
+        acc = {'bufferView': len(new_views) - 1, 'componentType': ctype,
+               'count': len(rows), 'type': gtype}
+        if ctype == 5126 and rows:
+            acc['min'] = [min(r[c] for r in rows) for c in range(nc)]
+            acc['max'] = [max(r[c] for r in rows) for c in range(nc)]
+        new_accs.append(acc)
+        return len(new_accs) - 1
+
+    # non-animation accessors first, keeping an index map for meshes
+    anim_accs = set()
+    for a in js['animations']:
+        for s in a.get('samplers', []):
+            anim_accs.add(s['input'])
+            anim_accs.add(s['output'])
+    remap = {}
+    for ai, a in enumerate(accs):
+        if ai in anim_accs:
+            continue
+        v = bvs[a['bufferView']]
+        remap[ai] = emit(read_acc(ai), a['componentType'], a['type'], v.get('target'))
+    for m in js.get('meshes', []):
+        for p in m.get('primitives', []):
+            for k, val in list(p.get('attributes', {}).items()):
+                p['attributes'][k] = remap[val]
+            if 'indices' in p:
+                p['indices'] = remap[p['indices']]
+
+    for a in js['animations']:
+        for s in a.get('samplers', []):
+            if id(s) not in new_for:
+                s['input'] = remap.get(s['input'], s['input'])
+                s['output'] = remap.get(s['output'], s['output'])
+                continue
+            times, vals = new_for[id(s)]
+            out_type = accs[s['output']]['type']
+            s['input'] = emit([(t,) for t in times], 5126, 'SCALAR')
+            s['output'] = emit(vals, 5126, out_type)
+
+    js['accessors'] = new_accs
+    js['bufferViews'] = new_views
+    js['buffers'] = [{'byteLength': len(new_bin)}]
+
+    jb = json.dumps(js, separators=(',', ':')).encode('utf-8')
+    while len(jb) % 4:
+        jb += b' '
+    while len(new_bin) % 4:
+        new_bin.append(0)
+    out = bytearray()
+    out += struct.pack('<4sII', b'glTF', 2, 12 + 8 + len(jb) + 8 + len(new_bin))
+    out += struct.pack('<I4s', len(jb), b'JSON') + jb
+    out += struct.pack('<I4s', len(new_bin), b'BIN\x00') + bytes(new_bin)
+    with open(path, 'wb') as f:
+        f.write(out)
+
+    log("decimation: {} -> {} animation keys ({:.1f}x smaller), max reconstruction "
+        "error {:.2e}".format(before, after,
+                              (float(before) / after) if after else 0.0, worst))
+    # ★The error is the whole justification for calling this lossless -- so it has to
+    # be able to FAIL.★ A plane-only rotation test once produced 1.39 (on components
+    # bounded to [-1,1]) and still sailed through the keyframe-cap check, i.e. a
+    # visibly broken shape that looked like a pass.
+    BUDGET = 2.0e-3
+    if worst > BUDGET:
+        log("!! decimation error {:.2e} exceeds {:.1e} -- keys were removed that linear/"
+            "slerp interpolation does NOT reproduce. Refusing to ship this.".format(
+                worst, BUDGET))
+        raise SystemExit(11)
+
+
 def glb_animation_names(path):
     with open(path, 'rb') as f:
         data = f.read()
@@ -817,35 +1165,24 @@ def main():
     #
     # So: take the HIGHEST rate whose estimated cost fits the budget, and say what
     # was traded if the shortest sequence still cannot get 2 frames.
-    KF_BUDGET = 28000          # leave headroom under MaxKeyframes 32000
-
-    def _estimate(f):
-        total = 0
-        for nm, _, _ in ranges:
-            owners = count_of.get(nm, 0) or 1
-            dsec = dur_of.get(nm, 0.0)
-            total += owners * (int(dsec * f) + 2)
-        return total
-
+    # Choose the rate for FIDELITY, not for size.  Enough frames that even the
+    # shortest sequence survives (a clip that samples to nothing is dropped by
+    # Blender and loses its NAME) and that retiming to the authored duration
+    # quantises cleanly.  Size is handled afterwards by decimate_glb_animations(),
+    # which removes the redundancy this introduces -- so under-sampling would trade
+    # fidelity for nothing.  Sampling down was tried first and wrecked durations:
+    # at the 10 fps a 28000-keyframe budget allowed, rpgmalehuman's 'run' came out
+    # 0.600s against an authored 0.667s and a 0.033s clip stretched to 0.300s.
     real = [d for d in dur_of.values() if d and d > 0.0]
     shortest = min(real) if real else 0.0
     fps = 24.0
-    for cand in (240.0, 180.0, 120.0, 90.0, 60.0, 48.0, 30.0, 24.0, 15.0, 12.0, 10.0):
-        if _estimate(cand) <= KF_BUDGET:
-            fps = cand
-            break
-    else:
-        fps = 10.0
-        log("  !! even 10 fps exceeds the keyframe budget -- this shape may lose "
-            "animation to the Int16 cap in ts_gltf.cpp")
+    if real:
+        fps = min(240.0, max(24.0, math.ceil(8.0 / shortest)))
     bpy.context.scene.render.fps = int(fps)
     bpy.context.scene.render.fps_base = 1.0
-    log("sampling at {} fps -- est. {} keyframes (budget {}, ts_gltf cap 32000)".format(
-        int(fps), _estimate(fps), KF_BUDGET))
-    if shortest > 0.0 and shortest * fps < 2.0:
-        log("  !! shortest sequence {:.3f}s gets only {:.1f} frames at this rate; "
-            "a clip that samples to nothing is DROPPED by Blender and loses its name"
-            .format(shortest, shortest * fps))
+    log("sampling at {} fps (shortest sequence {:.3f}s -> {:.0f} frames); "
+        "decimation removes the redundancy afterwards".format(
+            int(fps), shortest, shortest * fps))
     build_nla_tracks(ranges, count_of, dur_of, fps, owned)
     flip_winding_to_gltf_ccw()
     # Strips now start at frame 0, and the exporter bakes each track over its own
@@ -890,6 +1227,8 @@ def main():
         log("!! export produced no file")
         return 5
 
+    decimate_glb_animations(dst)
+
     names, js, raw, bin_off = glb_animation_names(dst)
     log("---- GLB ----")
     log("  size       : {} bytes".format(os.path.getsize(dst)))
@@ -924,6 +1263,25 @@ def main():
         log("!! FAIL: {} clip(s) do not start at 0 -- they will freeze then blip "
             "in game: {}".format(len(late), late))
         return 9
+
+    # ★Hard cap check on the FINAL file.★ ts_gltf builds one TS::Shape keyframe and
+    # one transform per sampled time, per (node, sequence); version 8 narrowed those
+    # indices to Int16 so the loader stops at 32000 and DROPS the rest -- silently,
+    # as far as the player is concerned.  Count what it will actually build.
+    kf_total = 0
+    for a in js.get('animations', []):
+        per_node = {}
+        for ch in a.get('channels', []):
+            nd = ch.get('target', {}).get('node')
+            cnt = acc[a['samplers'][ch['sampler']]['input']]['count']
+            per_node[nd] = max(per_node.get(nd, 0), cnt)
+        kf_total += sum(per_node.values())
+    log("  keyframes   : {} that ts_gltf will build (MaxKeyframes 32000, "
+        "MaxTransforms 65000)".format(kf_total))
+    if kf_total > 32000:
+        log("!! FAIL: over the Int16 keyframe cap -- ts_gltf would log \"animation data "
+            "exceeds the Int16 keyframe/transform indices\" and drop the remainder.")
+        return 10
 
     vol, npos, nneg = glb_signed_volume(js, raw, bin_off)
     log("  winding    : {} CCW-outward / {} CW-outward, total signed volume {:.3f}".format(
