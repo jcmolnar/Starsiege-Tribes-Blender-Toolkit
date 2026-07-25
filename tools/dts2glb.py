@@ -134,11 +134,130 @@ def sequence_ranges():
     return out
 
 
-def build_nla_tracks(ranges):
+def dts_sequence_owner_counts(path):
+    """How many NODES each sequence actually drives, read from the .dts itself.
+
+    ★This cannot be recovered from Blender.★ The DTS importer keys every node at
+    every sequence boundary, so the fcurves say "all 48 nodes own all 12
+    sequences" no matter what the file says.  The truth lives in the node ->
+    subsequence -> sequence table.
+
+    Returns a list indexed by SEQUENCE INDEX, which lines up with the timeline
+    markers because the importer emits them in sequence order.  Returns None if
+    the layout cannot be resolved, in which case the caller keeps every node
+    (the old behaviour) rather than guessing.
+
+    Layout per ts_shape.cpp:1073-1103 -- header, then nodes, sequences,
+    subsequences.  v7 uses Int32 fields (Node 5x4=20, SubSequence 3x4=12); v8
+    packs them into Int16 (10 and 6).  The sequence record stride is SOLVED for
+    rather than assumed: only the true stride leaves a subsequence table whose
+    every record is in range, which makes the parse self-verifying."""
+    try:
+        data = open(path, 'rb').read()
+        i = data.find(b"TS::Shape")
+        if i < 0:
+            return None
+        o = i + 10
+        (version, nNodes, nSeq, nSubSeq, nKeyframes, nTransforms, nNames,
+         nObjects, nDetails, nMeshes) = struct.unpack_from("<10i", data, o)
+        o += 40
+        if version >= 2:
+            o += 4                              # nTransitions
+        if version >= 4:
+            o += 4                              # nFrameTriggers
+        o += 4 + 12                             # fRadius + fCenter
+        if version > 7:
+            o += 24                             # bounds box (v8+)
+
+        if version <= 7:
+            node_rec, sub_rec, node_fmt, sub_fmt = 20, 12, "<5i", "<3i"
+        else:
+            node_rec, sub_rec, node_fmt, sub_fmt = 10, 6, "<5h", "<3h"
+
+        nodes = [struct.unpack_from(node_fmt, data, o + k * node_rec)
+                 for k in range(nNodes)]
+        seq_off = o + nNodes * node_rec
+
+        best = None
+        for stride in range(8, 96, 2):
+            ss_off = seq_off + nSeq * stride
+            if ss_off + nSubSeq * sub_rec > len(data):
+                continue
+            ok = True
+            for k in range(nSubSeq):
+                si, nk, fk = struct.unpack_from(sub_fmt, data, ss_off + k * sub_rec)
+                if not (0 <= si < nSeq and 0 <= nk <= nKeyframes
+                        and 0 <= fk <= nKeyframes and fk + nk <= nKeyframes):
+                    ok = False
+                    break
+            if ok:
+                best = stride
+                break
+        if best is None:
+            return None
+
+        ss_off = seq_off + nSeq * best
+        subs = [struct.unpack_from(sub_fmt, data, ss_off + k * sub_rec)
+                for k in range(nSubSeq)]
+        counts = [0] * nSeq
+        for (_nm, _par, nsub, firstsub, _dt) in nodes:
+            for k in range(firstsub, firstsub + nsub):
+                if 0 <= k < nSubSeq:
+                    counts[subs[k][0]] += 1
+        log("DTS v{}: {} node(s), {} sequence(s), sequence stride {} bytes "
+            "(subsequence table validates for all {} records)".format(
+                version, nNodes, nSeq, best, nSubSeq))
+        return counts
+    except Exception as e:
+        log("  !! could not read sequence ownership from the .dts: {}".format(e))
+        return None
+
+
+def has_keys_in(act, fs, fe):
+    """Does this action key anything inside [fs, fe]?"""
+    for fc in action_fcurves(act):
+        for kp in fc.keyframe_points:
+            if fs - 0.5 <= kp.co[0] <= fe + 0.5:
+                return True
+    return False
+
+
+def build_nla_tracks(ranges, owner_counts):
     """One NLA track per sequence, per animated object, each strip referencing
-    that sequence's sub-range of the object's single imported action."""
+    that sequence's sub-range of the object's single imported action.
+
+    ★A strip is created ONLY where the object actually has keys in that range.★
+    Node ownership per sequence is load-bearing, not cosmetic: an earlier build
+    gave every sequence a strip on every animated object, so `looks` -- which owns
+    ZERO nodes in tr_talon.dts -- came out owning all 48.  `looks` is the view
+    thread, positioned from camera pitch every frame
+    (player.cpp:702, pos = 0.5 + (-viewPitch/MaxPitch)*0.5), so it pinned the legs
+    to a pitch-derived pose and the walk animation never showed.  Joe saw exactly
+    that: "walking is not animated", and "move the camera fully up and the legs
+    move forward/backwards while idle".
+
+    Ground truth to diff against, from the DTS itself (tools v7_tracks.py):
+      run 48, fastrun 48, root 47, crouch root 48, Seq05 48, Seq06 48,
+      looks 0, sprint 48, fall 48, landing 48, Seq11 48, Seq12 48."""
     animated = 0
     strips = 0
+    per_seq = dict((n, 0) for n, _, _ in ranges)
+
+    # Which sequences drive nothing, straight from the .dts.  Marker order is
+    # sequence order, so ranges[i] pairs with owner_counts[i].
+    skip = set()
+    if owner_counts:
+        for i, (name, _, _) in enumerate(ranges):
+            if i < len(owner_counts):
+                if owner_counts[i] == 0:
+                    skip.add(name)
+                elif 0 < owner_counts[i] < len([o for o in bpy.data.objects
+                                                if o.animation_data and o.animation_data.action]):
+                    log("  note: '{}' drives {} node(s) in the .dts, not all -- keeping all, "
+                        "because which ones needs the name table".format(name, owner_counts[i]))
+    if skip:
+        log("sequences that drive NO nodes in the .dts: {}".format(sorted(skip)))
+
     for obj in bpy.data.objects:
         ad = obj.animation_data
         if not ad or not ad.action:
@@ -147,6 +266,10 @@ def build_nla_tracks(ranges):
         animated += 1
 
         for name, fs, fe in ranges:
+            if name in skip:
+                continue          # faithful: this sequence owns no nodes
+            if not has_keys_in(act, fs, fe):
+                continue          # this sequence does not drive this node
             track = ad.nla_tracks.new()
             track.name = name
             try:
@@ -154,6 +277,7 @@ def build_nla_tracks(ranges):
             except Exception as e:
                 log("  !! strip '{}' on '{}' failed: {}".format(name, obj.name, e))
                 continue
+            per_seq[name] += 1
             # Point the strip at this sequence's slice of the action.  Order
             # matters: widen the action range before pinning the strip range, or
             # Blender clamps one against the other.
@@ -170,8 +294,60 @@ def build_nla_tracks(ranges):
         # keep their own reference, so the action itself stays alive.
         ad.action = None
 
-    log("NLA: {} sequence(s) x {} animated object(s) = {} strip(s)".format(
-        len(ranges), animated, strips))
+    # A sequence that owns no nodes cannot be expressed in glTF -- an animation
+    # must carry at least one channel (spec 5.1: animation.channels minItems 1) --
+    # so it would silently vanish and take its NAME with it.  For "looks" that is
+    # fatal: the name is how Player::initResources:388 finds the view sequence, and
+    # a missing one is what crashed the client (player.cpp:700 -> SetSequence(-1)).
+    # Keep the name alive by parking it on ONE inert leaf node, so the view thread
+    # owns something harmless rather than the legs.
+    orphans = [n for n, _, _ in ranges if per_seq[n] == 0]
+    if orphans:
+        parents = set(o.parent.name for o in bpy.data.objects if o.parent)
+
+        def inert_rank(o):
+            return (o.name.lower() != 'bounds',      # prefer the bbox node
+                    o.type == 'MESH',                # then any non-mesh
+                    o.name.lower() not in ('cam', 'coll0'))
+
+        hosts = [o for o in bpy.data.objects
+                 if o.name not in parents            # leaf only: moving a parent moves its subtree
+                 and o.animation_data and o.animation_data.nla_tracks is not None]
+        hosts.sort(key=inert_rank)
+        for name in orphans:
+            fs, fe = [(s, e) for n, s, e in ranges if n == name][0]
+            placed = False
+            for host in hosts:
+                act = next((s.action for t in host.animation_data.nla_tracks
+                            for s in t.strips if s.action), None)
+                if not act:
+                    continue
+                track = host.animation_data.nla_tracks.new()
+                track.name = name
+                strip = track.strips.new(name, int(fs), act)
+                strip.frame_start = float(fs)
+                strip.frame_end = float(fe)
+                # Keep the real 2-frame range.  Collapsing it to a single instant
+                # was tried and BACKFIRED: a zero-length action range yields no
+                # sampled channels, Blender drops the animation, and the sequence
+                # NAME disappears -- which is the condition that crashed the client.
+                # The pose is constant anyway: the importer keys this node's held
+                # transform at both ends of a range the .dts gives it no track in.
+                strip.action_frame_start = float(fs)
+                strip.action_frame_end = float(fe)
+                per_seq[name] = 1
+                placed = True
+                log("  '{}' owns no nodes in the DTS -- parked on inert leaf '{}' "
+                    "to keep the sequence NAME (glTF needs >=1 channel)".format(name, host.name))
+                break
+            if not placed:
+                log("  !! '{}' owns no nodes and no inert host was found -- the name "
+                    "will be LOST".format(name))
+
+    log("NLA: {} animated object(s), {} strip(s)".format(animated, strips))
+    log("node ownership per sequence (diff this against tools/v7_tracks.py on the .dts):")
+    for n, _, _ in ranges:
+        log("    {:<14} {}".format(n, per_seq[n]))
     return animated, strips
 
 
@@ -318,7 +494,11 @@ def main():
         log("!! which the engine cannot bind (see this file's header). Aborting.")
         return 6
 
-    build_nla_tracks(ranges)
+    owner_counts = dts_sequence_owner_counts(src)
+    if owner_counts is None:
+        log("  !! sequence ownership unreadable -- every node will own every sequence,")
+        log("  !! which lets the view thread ('looks') pin nodes the walk should drive.")
+    build_nla_tracks(ranges, owner_counts)
     flip_winding_to_gltf_ccw()
 
     os.makedirs(os.path.dirname(dst), exist_ok=True)
