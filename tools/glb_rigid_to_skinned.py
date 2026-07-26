@@ -392,6 +392,70 @@ def convert(src, dst, verify=False, mode='rigid', radius=1.5, falloff=4.0):
         log("auto-weighting against {} bone segment(s), inverse-distance^{}, blending "
             "limited to hierarchy-adjacent bones".format(len(bones), falloff))
 
+    # ---- autoweight pre-pass: candidate bones from the RIGID BINDING ------------
+    #
+    # ★Picking bones by "nearest segment" GUESSES, and it guessed wrong.★  In game the
+    # legs came out identical to the .dts (their bones are well separated, so the guess
+    # was right) while the head lost its shape and sat off-centre from the shoulders,
+    # and a lying-down animation threw a single vertex into a long spike.  Around the
+    # neck and shoulders several bones sit close together, so nearest-segment picked the
+    # wrong one; a vertex that ends up weighted to a bone which then travels far is
+    # exactly what a spike is.
+    #
+    # But the artist ALREADY declared which bone owns each vertex -- that is what the
+    # rigid part binding IS.  Use it as the candidate set ({own} + hierarchy neighbours)
+    # instead of inferring it.
+    #
+    # ★The reason I did not do this first is that it appears to break the twin
+    # property★: coincident vertices come from DIFFERENT parts, so they would get
+    # different candidate sets and tear at the seam.  The fix is to UNION the candidate
+    # sets across each coincident group and compute the weights ONCE per position -- so
+    # a seam vertex is influenced by both parts' bones, identically on both sides.  That
+    # keeps seams welded AND stops the guessing.
+    autoweights = {}
+    if mode == 'autoweight':
+        def poskey(p):
+            return (round(p[0], 4), round(p[1], 4), round(p[2], 4))
+
+        groups = {}
+        for ni2 in mesh_nodes:
+            w2 = world[ni2]
+            own = joint_of.get(ni2)
+            if own is None:
+                continue
+            ownb = own
+            for prim2 in meshes[nodes[ni2]['mesh']].get('primitives', []):
+                if prim2.get('mode', 4) != 4:
+                    continue
+                at2 = prim2.get('attributes', {})
+                if 'POSITION' not in at2:
+                    continue
+                for p2 in read(at2['POSITION']):
+                    sp2 = xform_point(w2, p2)
+                    g = groups.setdefault(poskey(sp2), [sp2, set()])
+                    g[1].add(ownb)
+
+        spikes = 0
+        for k, (sp2, owners) in groups.items():
+            cand = set()
+            for b in owners:
+                cand.add(b)
+                cand.update(bone_adj.get(b, ()))
+            scored = sorted((_dist_point_segment(sp2, bones[c][0], bones[c][1]), c)
+                            for c in cand)[:4]
+            ws = [1.0 / ((d + 1e-4) ** falloff) for (d, _b) in scored]
+            tot = sum(ws) or 1.0
+            ws = [x / tot for x in ws]
+            while len(scored) < 4:
+                scored.append((0.0, scored[0][1]))
+                ws.append(0.0)
+            autoweights[k] = (tuple(bone_joint[b] for (_d, b) in scored), tuple(ws))
+            if len(owners) > 1:
+                spikes += 1
+        log("autoweight: {} distinct position(s), {} of them shared by more than one "
+            "part (seam vertices, weighted from the UNION of their parts' bones)"
+            .format(len(groups), spikes))
+
     prims_out = []
     checked = 0
     worst = 0.0
@@ -482,21 +546,18 @@ def convert(src, dst, verify=False, mode='rigid', radius=1.5, falloff=4.0):
                 # blending local to a joint -- an elbow vertex blends forearm and
                 # upper arm, never forearm and spine -- and stays POSITION-DERIVED, so
                 # coincident twins still agree and seams still hold.
+                # Look the weights up by POSITION: computed once per distinct point in
+                # the pre-pass above, so every coincident twin reads the same entry and
+                # seams cannot separate.
                 jr, wr = [], []
                 for sp in spos:
-                    dists = [_dist_point_segment(sp, b0, b1) for (b0, b1) in bones]
-                    nearest = min(range(len(bones)), key=lambda i: dists[i])
-                    cand = set([nearest])
-                    cand.update(bone_adj.get(nearest, ()))
-                    scored = sorted((dists[c], c) for c in cand)[:4]
-                    ws = [1.0 / ((d + 1e-4) ** falloff) for (d, _b) in scored]
-                    tot = sum(ws) or 1.0
-                    ws = [w / tot for w in ws]
-                    while len(scored) < 4:
-                        scored.append((0.0, scored[0][1]))
-                        ws.append(0.0)
-                    jr.append(tuple(bone_joint[b] for (_d, b) in scored))
-                    wr.append(tuple(ws))
+                    key = (round(sp[0], 4), round(sp[1], 4), round(sp[2], 4))
+                    entry = autoweights.get(key)
+                    if entry is None:
+                        # unreachable in practice; fall back to rigid rather than guess
+                        entry = ((jidx, 0, 0, 0), (1.0, 0.0, 0.0, 0.0))
+                    jr.append(entry[0])
+                    wr.append(entry[1])
                 newp['attributes']['JOINTS_0'] = emit(jr, 5123, 'VEC4')
                 newp['attributes']['WEIGHTS_0'] = emit(wr, 5126, 'VEC4')
             elif mode == 'blend':
