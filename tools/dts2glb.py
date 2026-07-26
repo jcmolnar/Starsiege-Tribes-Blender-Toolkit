@@ -117,24 +117,55 @@ def check_addon_freshness():
     That cost a full debugging cycle: a fix to the importer's keyframe placement
     sat in the repo while every conversion kept running the stale installed copy,
     so the measurement said the fix had not worked when it had simply never run.
-    Same family as a stale object file -- verify, do not assume."""
-    repo = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                        "main.py")
-    inst = os.path.join(bpy.utils.resource_path('USER'), "scripts", "addons",
-                        ADDON_MODULE, "main.py")
+    Same family as a stale object file -- verify, do not assume.
+
+    ★Compares EVERY .py in the addon, not just main.py.★  It used to check main.py
+    alone, which made it blind in precisely the way it exists to prevent: the DTS
+    PARSER lives in dts.py, so a fix there would sit in the repo, never take effect,
+    and this function would cheerfully report "installed copy matches the repo".  A
+    guard that says OK while unable to see the file you actually changed is worse than
+    no guard -- it upgrades a stale-code bug into a wrong-conclusion bug."""
+    repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    inst_dir = os.path.join(bpy.utils.resource_path('USER'), "scripts", "addons",
+                            ADDON_MODULE)
     try:
-        if not (os.path.exists(repo) and os.path.exists(inst)):
+        if not (os.path.isdir(repo_dir) and os.path.isdir(inst_dir)):
             return
-        a = open(repo, 'rb').read()
-        b = open(inst, 'rb').read()
-        if a == b:
-            log("addon: installed copy matches the repo")
+        # Compare only files present in BOTH places.  The repo root also holds ~124
+        # one-off analysis scripts that were never installed and never should be;
+        # reporting those as "stale" buries the real signal, and a check nobody can
+        # read is a check nobody acts on.
+        names = sorted(set(f for f in os.listdir(repo_dir) if f.endswith('.py'))
+                       & set(f for f in os.listdir(inst_dir) if f.endswith('.py')))
+        # ...but these ARE the import path, so their absence on either side is itself
+        # the failure this guard exists to catch.
+        CRITICAL = ("main.py", "dts.py", "kaitaistruct.py")
+        stale, checked = [], 0
+        for nm in CRITICAL:
+            if not os.path.exists(os.path.join(repo_dir, nm)):
+                stale.append((nm, "MISSING FROM THE REPO"))
+            elif not os.path.exists(os.path.join(inst_dir, nm)):
+                stale.append((nm, "MISSING FROM THE INSTALLED ADDON"))
+        for nm in names:
+            a = open(os.path.join(repo_dir, nm), 'rb').read()
+            b = open(os.path.join(inst_dir, nm), 'rb').read()
+            checked += 1
+            if a != b:
+                mark = "  <-- IMPORT PATH" if nm in CRITICAL else ""
+                stale.append((nm, "repo {} bytes vs installed {}{}"
+                              .format(len(a), len(b), mark)))
+        if not stale:
+            log("addon: installed copy matches the repo ({} .py file(s) compared)"
+                .format(checked))
             return
-        log("!! ADDON IS STALE -- the installed copy differs from this repo:")
-        log("!!   repo      {} bytes  {}".format(len(a), repo))
-        log("!!   installed {} bytes  {}".format(len(b), inst))
-        log("!! addon_enable() loads the INSTALLED one, so repo edits to main.py")
-        log("!! (the DTS importer) are NOT in effect.  Copy it across and re-run.")
+        log("!! ADDON IS STALE -- {} file(s) differ between repo and installed:"
+            .format(len(stale)))
+        for nm, why in stale:
+            log("!!   {:<22} {}".format(nm, why))
+        log("!!   repo      {}".format(repo_dir))
+        log("!!   installed {}".format(inst_dir))
+        log("!! addon_enable() loads the INSTALLED copy, so those repo edits are NOT in")
+        log("!! effect.  Copy them across and re-run.")
     except Exception as e:
         log("addon freshness check skipped: {}".format(e))
 
