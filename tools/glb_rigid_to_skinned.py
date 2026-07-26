@@ -123,6 +123,26 @@ def xform_point(m, p):
             m[2] * p[0] + m[6] * p[1] + m[10] * p[2] + m[14])
 
 
+def _dist_point_segment(p, a, b):
+    """Distance from p to the segment ab.  Used for auto-weighting: a bone is a
+    SEGMENT, and measuring to the joint pivot instead makes a long bone's midpoint
+    equidistant from both ends, which smears weight along the whole limb."""
+    abx, aby, abz = b[0] - a[0], b[1] - a[1], b[2] - a[2]
+    apx, apy, apz = p[0] - a[0], p[1] - a[1], p[2] - a[2]
+    denom = abx * abx + aby * aby + abz * abz
+    if denom <= 1e-12:
+        return math.sqrt(apx * apx + apy * apy + apz * apz)
+    t = (apx * abx + apy * aby + apz * abz) / denom
+    if t < 0.0:
+        t = 0.0
+    elif t > 1.0:
+        t = 1.0
+    dx = apx - abx * t
+    dy = apy - aby * t
+    dz = apz - abz * t
+    return math.sqrt(dx * dx + dy * dy + dz * dz)
+
+
 def xform_dir(m, p):
     return (m[0] * p[0] + m[4] * p[1] + m[8] * p[2],
             m[1] * p[0] + m[5] * p[1] + m[9] * p[2],
@@ -282,7 +302,7 @@ def render_detail_subtree(js):
     return root, subtree
 
 
-def convert(src, dst, verify=False, mode='rigid', radius=1.5):
+def convert(src, dst, verify=False, mode='rigid', radius=1.5, falloff=4.0):
     js, binc = load_glb(src)
     read = make_reader(js, binc)
     nodes = js.get('nodes', [])
@@ -339,6 +359,38 @@ def convert(src, dst, verify=False, mode='rigid', radius=1.5):
             acc['min'], acc['max'] = mins, maxs
         new_accs.append(acc)
         return len(new_accs) - 1
+
+    # ---- bone segments, for --autoweight ----------------------------------
+    # One segment per joint that has a parent: parent-position -> joint-position, in
+    # scene space at REST.  A joint with no parent contributes a degenerate segment at
+    # its own position so it can still attract nearby vertices.
+    bones = []
+    bone_joint = []
+    for n in joints:
+        w = world[n]
+        pj = parent_of.get(n)
+        here = (w[12], w[13], w[14])
+        if pj is not None and pj in joint_of:
+            pw = world[pj]
+            bones.append((here, (pw[12], pw[13], pw[14])))
+        else:
+            bones.append((here, here))
+        bone_joint.append(joint_of[n])
+    # bone adjacency (parent + children), by BONE index, for locality-limited blending
+    bone_of_node = dict((n, i) for i, n in enumerate(joints))
+    bone_adj = {}
+    for i, n in enumerate(joints):
+        adj = set()
+        pj = parent_of.get(n)
+        if pj is not None and pj in bone_of_node:
+            adj.add(bone_of_node[pj])
+        for c in nodes[n].get('children', []):
+            if c in bone_of_node:
+                adj.add(bone_of_node[c])
+        bone_adj[i] = adj
+    if mode == 'autoweight':
+        log("auto-weighting against {} bone segment(s), inverse-distance^{}, blending "
+            "limited to hierarchy-adjacent bones".format(len(bones), falloff))
 
     prims_out = []
     checked = 0
@@ -398,6 +450,55 @@ def convert(src, dst, verify=False, mode='rigid', radius=1.5):
                 jrow, wrow = (jidx, jidx, jidx, jidx), (0.25, 0.25, 0.25, 0.25)
                 newp['attributes']['JOINTS_0'] = emit([jrow] * len(spos), 5123, 'VEC4')
                 newp['attributes']['WEIGHTS_0'] = emit([wrow] * len(spos), 5126, 'VEC4')
+            elif mode == 'autoweight':
+                # ★POSITION-ONLY weighting, and that is the whole trick.★
+                #
+                # A .dts character is separate rigid parts, so the vertices either side
+                # of a knee are DUPLICATED -- two coincident points belonging to two
+                # meshes.  Weighting by "which part did this vertex come from" gives
+                # those twins different weights, so they separate under animation and
+                # the limb tears (which is exactly what --blend does).
+                #
+                # Weight purely by the vertex's POSITION relative to the bone segments
+                # and the twins get IDENTICAL weights by construction: they are at the
+                # same point, so they move together, the seam holds, and the limb
+                # actually bends.  No shared topology required, which is what lets a
+                # 1998 part-based character become a genuinely skinned one.
+                #
+                # Falloff is inverse-distance-to-BONE-SEGMENT (not to the joint pivot):
+                # a pivot-distance falloff makes a long bone's midpoint equidistant
+                # from both ends and smears weight across the whole limb.
+                # ★Blend only with bones ADJACENT IN THE HIERARCHY to the nearest one.★
+                # Inverse-distance over ALL bones does not work on a humanoid: the
+                # spine, chest and both shoulders are all close together, so nearly
+                # every vertex finds several "near" bones and the weights smear.
+                # Measured on rpgmalehuman with all 36 bones in play: median dominant
+                # weight 0.477 and 93% of vertices carrying a significant second
+                # influence -- a soft, melted look.  Raising the falloff exponent does
+                # not fix it (even ^24 left 59% blended); the candidate SET is wrong,
+                # not the curve.
+                #
+                # Restricting to {nearest} + {its parent} + {its children} keeps
+                # blending local to a joint -- an elbow vertex blends forearm and
+                # upper arm, never forearm and spine -- and stays POSITION-DERIVED, so
+                # coincident twins still agree and seams still hold.
+                jr, wr = [], []
+                for sp in spos:
+                    dists = [_dist_point_segment(sp, b0, b1) for (b0, b1) in bones]
+                    nearest = min(range(len(bones)), key=lambda i: dists[i])
+                    cand = set([nearest])
+                    cand.update(bone_adj.get(nearest, ()))
+                    scored = sorted((dists[c], c) for c in cand)[:4]
+                    ws = [1.0 / ((d + 1e-4) ** falloff) for (d, _b) in scored]
+                    tot = sum(ws) or 1.0
+                    ws = [w / tot for w in ws]
+                    while len(scored) < 4:
+                        scored.append((0.0, scored[0][1]))
+                        ws.append(0.0)
+                    jr.append(tuple(bone_joint[b] for (_d, b) in scored))
+                    wr.append(tuple(ws))
+                newp['attributes']['JOINTS_0'] = emit(jr, 5123, 'VEC4')
+                newp['attributes']['WEIGHTS_0'] = emit(wr, 5126, 'VEC4')
             elif mode == 'blend':
                 # Real two-joint blending: vertices near this joint's pivot share
                 # influence with its PARENT, so the seam bends instead of cracking.
@@ -523,13 +624,18 @@ def main():
         mode = 'split'
     if '--blend' in sys.argv:
         mode = 'blend'
+    if '--autoweight' in sys.argv:
+        mode = 'autoweight'
     radius = 1.5
+    falloff = 4.0
     for a in sys.argv[1:]:
         if a.startswith('--radius='):
             radius = float(a.split('=', 1)[1])
+        if a.startswith('--falloff='):
+            falloff = float(a.split('=', 1)[1])
     log("mode: {}{}".format(mode, "  radius={}".format(radius) if mode == 'blend' else ""))
     return convert(args[0], args[1], verify='--verify' in sys.argv,
-                   mode=mode, radius=radius)
+                   mode=mode, radius=radius, falloff=falloff)
 
 
 if __name__ == '__main__':
