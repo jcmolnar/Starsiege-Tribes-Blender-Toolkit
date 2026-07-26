@@ -28,19 +28,23 @@ animation for a wire value it received correctly.
 Checks performed:
   1. index-for-index name equality over the contracted range 0..15;
   2. sequence COUNT, and any duplicate names in the source (the collapse hazard);
-  3. presence of the load-bearing names script looks up by string --
-     "power", "activate", "use", "deploy", "root" -- reported, not enforced, since
-     which ones matter depends on the object class.
+  3. preservation of the engine-resolved mount-node names;
+  4. effective render-detail coverage, so the converted shape cannot vanish at
+     a distance where the source still has a selectable LOD.
 """
 
 import glob
 import json
 import os
+import re
 import struct
 import sys
 
 MAX_SEQUENCE_INDEX = 16          # shapebase.h:21-29
 LOAD_BEARING = ("power", "activate", "use", "deploy", "root")
+ENGINE_MOUNT_NAMES = ("collision", "dummy exit", "dummy eye", "dummy muzzle",
+                      "dummyalways chasecam", "dummyalways muzzle",
+                      "dummyalways root", "kill 15")
 NUL = b"\x00"                    # named, so no escaping layer can mangle it
 
 
@@ -52,7 +56,8 @@ def log(m):
 def dts_sequences(path):
     """Sequence names IN ORDER, by the deterministic offset walk (same record sizes
     and read order as dts2glb.py -- see ts_shape.cpp:1122-1142)."""
-    raw = open(path, 'rb').read()
+    with open(path, 'rb') as stream:
+        raw = stream.read()
     i = raw.find(b"TS::Shape")
     if i < 0:
         return None, "no TS::Shape tag"
@@ -128,7 +133,8 @@ def dts_node_names(path):
 
 
 def glb_node_names(path):
-    data = open(path, 'rb').read()
+    with open(path, 'rb') as stream:
+        data = stream.read()
     if data[0:4] != b'glTF':
         return None
     off = 12
@@ -140,6 +146,120 @@ def glb_node_names(path):
             return [n.get('name', '') for n in js.get('nodes', [])]
         off += clen
     return None
+
+
+def dts_detail_sizes(path):
+    """Return the source shape's render-detail thresholds.
+
+    Detail::fSize is the minimum projected pixel size at which that detail may
+    render (ts_shape.cpp:419-427).  Zero-sized records are utility details and
+    never participate in selectDetail().
+    """
+    with open(path, 'rb') as stream:
+        raw = stream.read()
+    i = raw.find(b"TS::Shape")
+    if i < 0:
+        return None
+    o = i + 10
+    (ver, nNodes, nSeq, nSubSeq, nKF, nXF, nNames, nObj, nDet,
+     nMesh) = struct.unpack_from("<10i", raw, o)
+    o += 40
+    if ver >= 2:
+        o += 4
+    if ver >= 4:
+        o += 4
+    o += 16
+    if ver > 7:
+        o += 24
+    if ver < 5:
+        return None
+
+    nrec = 20 if ver <= 7 else 10
+    srec = 12 if ver <= 7 else 6
+    kfrec = 12 if ver <= 7 else 8
+    xfrec = 40 if ver < 7 else (32 if ver == 7 else 20)
+    objrec = 72 if ver <= 7 else 28
+    detail_off = (o + nNodes * nrec + nSeq * 32 + nSubSeq * srec +
+                  nKF * kfrec + nXF * xfrec + nNames * 24 +
+                  nObj * objrec)
+    if detail_off + nDet * 8 > len(raw):
+        return None
+    sizes = [struct.unpack_from("<If", raw, detail_off + k * 8)[1]
+             for k in range(nDet)]
+    return [s for s in sizes if s > 0.0]
+
+
+def glb_effective_detail_sizes(path):
+    """Reproduce ts_gltf.cpp::buildDetails' effective render thresholds.
+
+    glTF has no native DTS LOD record, so the loader derives detail roots from
+    top-level node names ending in an integer.  A GLB with no such roots gets
+    one always-visible detail at size 1.  Critically, a --one-lod conversion
+    retains the source's highest-detail name (for example ``root 25``), but the
+    loader lowers that lone render threshold to 1 so the shape cannot vanish
+    before the source's coarsest LOD would.  The gate must model that runtime
+    normalization or it will reject the fixed asset and validate the wrong
+    representation.
+    """
+    with open(path, 'rb') as stream:
+        data = stream.read()
+    if data[0:4] != b'glTF':
+        return None
+    off = 12
+    js = None
+    while off + 8 <= len(data):
+        clen, ctype = struct.unpack_from('<I4s', data, off)
+        off += 8
+        if off + clen > len(data):
+            return None
+        if ctype == b'JSON':
+            js = json.loads(data[off:off + clen].decode('utf-8'))
+            break
+        off += clen
+    if js is None:
+        return None
+
+    nodes = js.get('nodes', [])
+    parents = [-1] * len(nodes)
+    for parent, node in enumerate(nodes):
+        for child in node.get('children', []):
+            if isinstance(child, int) and 0 <= child < len(nodes):
+                parents[child] = parent
+
+    trailing = []
+    for node in nodes:
+        name = node.get('name', '')
+        m = re.search(r'(\d+)$', name)
+        trailing.append(int(m.group(1)) if m and m.start(1) > 0 else None)
+
+    sizes = []
+    for idx, size in enumerate(trailing):
+        if size is None:
+            continue
+        parent = parents[idx]
+        ancestor_is_detail = False
+        while parent >= 0:
+            if trailing[parent] is not None:
+                ancestor_is_detail = True
+                break
+            parent = parents[parent]
+        if not ancestor_is_detail and size > 0:
+            sizes.append(float(size))
+
+    if not sizes:
+        # No derived details at all gets the loader's node-0/size-1 fallback.
+        # If suffixed nodes existed but all were utility size 0, buildDetails
+        # does NOT add that fallback: there is genuinely no render detail.
+        return [1.0] if not any(s is not None for s in trailing) else []
+    if len(sizes) == 1 and sizes[0] > 1.0:
+        sizes[0] = 1.0
+    return sizes
+
+
+def detail_coverage_ok(source_sizes, converted_sizes):
+    """Whether the converted shape remains selectable as far as the source."""
+    return (bool(source_sizes) and bool(converted_sizes) and
+            min(converted_sizes) <= min(source_sizes) + 1.0e-6)
 
 
 def check_compat(dts_path, glb_path):
@@ -158,8 +278,11 @@ def check_compat(dts_path, glb_path):
          (shapebase.h:21-29).  Disagree and a station plays a different animation on
          each client for the same packet.
       3. NODE NAMES -- mount points resolve BY NAME (player.cpp:377,578:
-         findNode("dummyalways root") / findNode("dummyalways chasecam")), and
-         insertOverride matches by node-name prefix.  A renamed node silently unmounts.
+          findNode("dummyalways root") / findNode("dummyalways chasecam")), and
+          insertOverride matches by node-name prefix.  A renamed node silently unmounts.
+      4. DETAIL COVERAGE -- the converted shape must retain a selectable render
+         detail at least as far away as the source.  Different LOD geometry is
+         legal; disappearing sooner is not.
 
     Everything else is client-local and free to differ: vertex counts, materials, LODs,
     bone structure, skinning, texture sizes.  That is what makes mixed servers possible
@@ -170,7 +293,10 @@ def check_compat(dts_path, glb_path):
     anims = glb_animations(glb_path)
     dnodes = dts_node_names(dts_path)
     gnodes = glb_node_names(glb_path)
-    if seqs is None or anims is None or dnodes is None or gnodes is None:
+    dsizes = dts_detail_sizes(dts_path)
+    gsizes = glb_effective_detail_sizes(glb_path)
+    if (seqs is None or anims is None or dnodes is None or gnodes is None or
+            dsizes is None or gsizes is None):
         log("!! could not read one of the pair (%s)" % (err or "bad glb"))
         return 2
 
@@ -208,10 +334,6 @@ def check_compat(dts_path, glb_path):
     #
     # This list is MEASURED, not guessed: every literal passed to findNode/
     # getNodeAtCurrentDetail in program\code and engine\Ts3\code.
-    ENGINE_NODES = ("collision", "dummy exit", "dummy eye", "dummy muzzle",
-                    "dummyalways chasecam", "dummyalways muzzle", "dummyalways root",
-                    "kill 15")
-
     def resolves(names, base):
         # exact, or any per-detail variant "<base><digits>"
         for nm in names:
@@ -224,7 +346,7 @@ def check_compat(dts_path, glb_path):
         return False
 
     broken_mounts = []
-    for base in ENGINE_NODES:
+    for base in ENGINE_MOUNT_NAMES:
         if resolves(dnodes, base) and not resolves(gnodes, base):
             broken_mounts.append(base)
 
@@ -237,6 +359,29 @@ def check_compat(dts_path, glb_path):
     else:
         log("   3. mount nodes: all engine-referenced names still resolve "
             "(%d other node name(s) dropped, all LOD duplicates)" % len(dropped))
+
+    # fSize is a MINIMUM projected size.  A converted client may deliberately
+    # use fewer LODs, but it must still have a render detail at least as far
+    # away as the source: converted min <= source min.  This is the precise
+    # contract the first indoorgun.glb violated (25 vs source 1), producing a
+    # near-only turret while every geometry/sequence/material gate passed.
+    if not dsizes:
+        log("   4. DETAIL COVERAGE: source has no render detail -- cannot validate")
+        problems += 1
+    elif not gsizes:
+        log("   4. DETAIL COVERAGE LOST: .glb has no render detail")
+        log("      -> the converted shape is never selected for drawing.")
+        problems += 1
+    else:
+        dmin, gmin = min(dsizes), min(gsizes)
+        if not detail_coverage_ok(dsizes, gsizes):
+            log("   4. DETAIL COVERAGE SHRANK: source min %.3g px, .glb min %.3g px"
+                % (dmin, gmin))
+            log("      -> the converted shape vanishes sooner as distance increases.")
+            problems += 1
+        else:
+            log("   4. detail coverage: source min %.3g px, .glb effective min %.3g px"
+                % (dmin, gmin))
 
     if problems:
         log("   VERDICT: NOT interchangeable -- a mixed server would show different")
@@ -306,6 +451,21 @@ def check_pair(dts_path, glb_path):
     if missing:
         log("   *** LOST in conversion: %s *** -- script looks these up BY NAME" % missing)
         return 1
+
+    dsizes = dts_detail_sizes(dts_path)
+    gsizes = glb_effective_detail_sizes(glb_path)
+    if dsizes is None or gsizes is None:
+        log("   !! could not read detail thresholds")
+        return 2
+    if not dsizes or not gsizes:
+        log("   *** NO RENDER DETAIL after conversion ***")
+        return 1
+    if not detail_coverage_ok(dsizes, gsizes):
+        log("   *** DETAIL COVERAGE SHRANK: source min %.3g px -> .glb min %.3g px ***"
+            % (min(dsizes), min(gsizes)))
+        return 1
+    log("   detail coverage: source min %.3g px -> .glb effective min %.3g px"
+        % (min(dsizes), min(gsizes)))
     return 1 if bad else 0
 
 
