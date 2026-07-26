@@ -641,19 +641,39 @@ def build_nla_tracks(ranges, count_of, dur_of, fps, owned):
                     o.type == 'MESH',                # then any non-mesh
                     o.name.lower() not in ('cam', 'coll0'))
 
+        # ★Do NOT require the host to already own an action.★  It used to, and that
+        # silently lost every CEL-ONLY shape: a shape whose only sequence animates
+        # object VISIBILITY (a door swinging open, a turret swapping to its hulk) gives
+        # no node a transform track, so after the main loop clears ad.action nothing has
+        # an action left to borrow -- no host, name dropped, conversion fails with
+        # "no inert host was found".  64 shapes in the 823-shape corpus are cel-only.
+        # A host without an action now gets a purpose-built constant one below.
         hosts = [o for o in bpy.data.objects
-                 if o.name not in parents            # leaf only: moving a parent moves its subtree
-                 and o.animation_data and o.animation_data.nla_tracks is not None]
+                 if o.name not in parents]           # leaf only: moving a parent moves its subtree
         hosts.sort(key=inert_rank)
         for name in orphans:
             si = [i for i, (n, _, _) in enumerate(ranges) if n == name][0]
             fs, fe = ranges[si][1], ranges[si][2]
             placed = False
             for host in hosts:
+                if not host.animation_data:
+                    host.animation_data_create()
                 act = next((s.action for t in host.animation_data.nla_tracks
                             for s in t.strips if s.action), None)
                 if not act:
-                    continue
+                    # Author a constant two-key action on the host's own location.  Going
+                    # through keyframe_insert rather than action.fcurves.new keeps this
+                    # working across the 4.4+ slotted-action refactor, where an Action's
+                    # channels moved into layers/slots.
+                    for f in (fs, fe):
+                        host.keyframe_insert(data_path="location", frame=int(f))
+                    act = host.animation_data.action
+                    if not act:
+                        continue
+                    host.animation_data.action = None
+                    log("  authored a constant action on '{}' to host orphan "
+                        "sequence(s) -- this shape animates objects, not nodes"
+                        .format(host.name))
                 track = host.animation_data.nla_tracks.new()
                 track.name = name
                 strip = track.strips.new(name, 0, act)
@@ -1297,6 +1317,240 @@ def inject_material_extras(path, map_of):
             .format(len(unmatched), unmatched[:4]))
 
 
+def dts_cel_tracks(path):
+    """Per-OBJECT cel tracks (visibility / material / frame), read from the .dts.
+
+    ★A DTS sequence can animate two different things, and only one of them is a
+    transform.★  Node subsequences move nodes; OBJECT subsequences carry cel keys
+    whose fMatIndex bits say "this object is visible / uses material M / shows mesh
+    frame F" (ts_shape.h:127-163).  ts_gltf.cpp:1346 sets `obj.fnSubSequences = 0`
+    with the comment "no morph/visibility track", so the whole object half was
+    dropped on load -- and glTF has no visibility channel to carry it either.
+
+    That is not a corner case.  Measured across the 823-shape corpus:
+        154 shapes (18.7%) carry cel tracks -- 207 sequences, 7,941 keyframes
+         64 of them are cel-ONLY, and fail conversion loudly ("owns no nodes")
+         90 are MIXED, and convert CLEANLY while losing the cel half in silence
+    The silent 90 are the dangerous ones.  Six shapes in the model suite are in
+    that set -- tr_talon, Vyper, newflyer, mortar_turret, radar_small, ammopad --
+    and every one passed every gate the suite had.
+
+    And the loss is visible, not academic.  mortar_turret's "visibility" sequence is
+    the DESTRUCTION SWAP:
+        base 25   visible @0 -> invisible @1
+        hulk 25   invisible @0 -> visible @1
+    fVisible defaults to !DefaultInvisible (ts_shapeInst.cpp:797), so with the track
+    gone BOTH are visible: a destroyed turret draws its intact body and its wreckage
+    in the same place.  Doors are the same mechanism -- 30-odd of them animate open
+    purely by swapping which panel object is visible.
+
+    Returns ({objectName: {seqName: [(pos, flags, keyValue, matIndex), ...]}},
+             [sequence names]) or (None, None).  flags is a small bitfield:
+        1 visible   2 caresVisibility   4 caresMaterial   8 caresFrame
+
+    Record layouts, all read from the engine (see dts_sequence_owner_counts for the
+    node/sequence/subsequence/keyframe/transform sizes, which this shares):
+        Object  v<=7  V7Object  Int16,Int16,Int32,Int32,TMat3F,Int32,Int32 = 72
+                      (ts_shape.cpp:1005-1013; TMat3F = RMat3F{Int32 flags +
+                      float[3][3]} + Point3F = 40 + 12, m_mat3.h:39-97)
+                v8    Object    Int16,Int16,Int32,Int16,[pad2],Point3F,Int16,Int16
+                      = 28, subsequence fields at +24 (ts_shape.h:227-249, pack(4))
+    """
+    try:
+        data = open(path, 'rb').read()
+        i = data.find(b"TS::Shape")
+        if i < 0:
+            return None, None
+        o = i + 10
+        (version, nNodes, nSeq, nSubSeq, nKeyframes, nTransforms, nNames,
+         nObjects, nDetails, nMeshes) = struct.unpack_from("<10i", data, o)
+        o += 40
+        if version >= 2:
+            o += 4
+        if version >= 4:
+            o += 4
+        o += 4 + 12
+        if version > 7:
+            o += 24
+        if version < 5:
+            return None, None
+
+        node_rec = 20 if version <= 7 else 10
+        sub_rec = 12 if version <= 7 else 6
+        sub_fmt = "<3i" if version <= 7 else "<3h"
+        kf_rec = 12 if version <= 7 else 8
+        kf_fmt = "<fII" if version <= 7 else "<fHH"
+        xf_rec = 40 if version < 7 else (32 if version == 7 else 20)
+        obj_rec = 72 if version <= 7 else 28
+
+        seq_off = o + nNodes * node_rec
+        ss_off = seq_off + nSeq * 32
+        kf_off = ss_off + nSubSeq * sub_rec
+        xf_off = kf_off + nKeyframes * kf_rec
+        name_off = xf_off + nTransforms * xf_rec
+        obj_off = name_off + nNames * 24
+        if obj_off + nObjects * obj_rec > len(data):
+            log("  !! computed object table runs past EOF -- no cel tracks read")
+            return None, None
+
+        names = [data[name_off + 24 * k:name_off + 24 * k + 24].split(b"\x00")[0]
+                 .decode("latin1") for k in range(nNames)]
+        subs = [struct.unpack_from(sub_fmt, data, ss_off + k * sub_rec)
+                for k in range(nSubSeq)]
+        kfs = [struct.unpack_from(kf_fmt, data, kf_off + k * kf_rec)
+               for k in range(nKeyframes)]
+        seqnames = []
+        for s in range(nSeq):
+            ni = struct.unpack_from("<i", data, seq_off + s * 32)[0]
+            if not (0 <= ni < nNames):
+                return None, None
+            seqnames.append(names[ni])
+
+        for (si, nk, fk) in subs:
+            if not (0 <= si < nSeq and 0 <= nk <= nKeyframes
+                    and 0 <= fk <= nKeyframes and fk + nk <= nKeyframes):
+                log("  !! subsequence out of range -- no cel tracks read")
+                return None, None
+
+        # v7 keyframes hold the same four flags in the HIGH bits of 32-bit fields
+        # (ts_shape.cpp:991-994) rather than the 16-bit 0x8000..0x1000 of v8
+        # (ts_shape.h:157-163).  Reading v7 with the v8 masks would silently produce
+        # zero flags -- every key would say "cares about nothing" and the track would
+        # be a no-op, which looks exactly like success.
+        if version <= 7:
+            M_VIS, M_CV, M_CM, M_CF, M_MAT = (0x80000000, 0x40000000,
+                                              0x20000000, 0x10000000, 0x0fffffff)
+        else:
+            M_VIS, M_CV, M_CM, M_CF, M_MAT = 0x8000, 0x4000, 0x2000, 0x1000, 0x0fff
+
+        out = {}
+        for k in range(nObjects):
+            b = obj_off + k * obj_rec
+            nmIdx = struct.unpack_from("<h", data, b)[0]
+            if version <= 7:
+                nss, fss = struct.unpack_from("<ii", data, b + 64)
+            else:
+                nss, fss = struct.unpack_from("<hh", data, b + 24)
+            if not (0 <= nmIdx < nNames):
+                log("  !! object {} name index {} out of range -- no cel tracks read"
+                    .format(k, nmIdx))
+                return None, None
+            if not (0 <= nss < 4096 and 0 <= fss <= nSubSeq and fss + nss <= nSubSeq):
+                log("  !! object {} subsequence range {}+{} out of {} -- no cel "
+                    "tracks read".format(k, fss, nss, nSubSeq))
+                return None, None
+            if not nss:
+                continue
+            per_seq = {}
+            for s in range(fss, fss + nss):
+                si, nk, fk = subs[s]
+                keys = []
+                for j in range(fk, fk + nk):
+                    pos, kv, mi = kfs[j]
+                    flags = ((1 if mi & M_VIS else 0) | (2 if mi & M_CV else 0)
+                             | (4 if mi & M_CM else 0) | (8 if mi & M_CF else 0))
+                    keys.append((pos, flags, kv, mi & M_MAT))
+                if keys:
+                    keys.sort(key=lambda t: t[0])   # findCelKey bisects on position
+                    per_seq[seqnames[si]] = keys
+            if per_seq:
+                out.setdefault(names[nmIdx], {}).update(per_seq)
+        return (out or None), seqnames
+    except Exception as e:
+        log("  !! cel-track read failed ({}) -- continuing without them".format(e))
+        return None, None
+
+
+# Delimiters of the dtsCel encoding.  A sequence or object name containing one of
+# these would corrupt the parse, so emit refuses rather than mangling.
+_CEL_DELIMS = ';=|,"\\'
+
+
+def inject_cel_extras(path, tracks):
+    """Carry the .dts cel tracks into the GLB as NODE extras.
+
+    Mapping is exact and needs no heuristic: the exported glTF node name IS the .dts
+    object name -- verified on mortar_turret, whose nodes come out as 'base 25',
+    'hulk 25', 'sideL 25' matching the object table byte for byte.  Objects that
+    --one-lod dropped simply have no node, which is correct and is reported, not
+    silently ignored.
+
+    Encoding (a string, like dtsMapFile, so it rides the same proven gltfExtraStr
+    reader instead of needing a JSON parser in the engine):
+        "seqName=pos,flags,keyValue,matIndex|pos,...;seqName2=..."
+    """
+    if not tracks:
+        return
+    with open(path, 'rb') as f:
+        data = f.read()
+    if data[0:4] != b'glTF':
+        return
+    off, chunks, js = 12, [], None
+    while off + 8 <= len(data):
+        clen, ctype = struct.unpack_from('<I4s', data, off)
+        off += 8
+        chunk = data[off:off + clen]
+        off += clen
+        if ctype == b'JSON':
+            js = json.loads(chunk.decode('utf-8'))
+            chunks.append([ctype, None])
+        else:
+            chunks.append([ctype, chunk])
+    if js is None or not js.get('nodes'):
+        return
+
+    by_name = {}
+    for n in js['nodes']:
+        if n.get('name'):
+            by_name.setdefault(n['name'], n)
+
+    tagged, keys_out, unmatched, refused = 0, 0, [], []
+    for objname, per_seq in sorted(tracks.items()):
+        node = by_name.get(objname)
+        if node is None:
+            unmatched.append(objname)
+            continue
+        bad = [s for s in per_seq if any(c in s for c in _CEL_DELIMS)]
+        if bad or any(c in objname for c in _CEL_DELIMS):
+            refused.append(objname)
+            continue
+        parts = []
+        for seqname in sorted(per_seq):
+            keys = per_seq[seqname]
+            parts.append('{}={}'.format(seqname, '|'.join(
+                '{:g},{:d},{:d},{:d}'.format(p, f, kv, mi) for (p, f, kv, mi) in keys)))
+            keys_out += len(keys)
+        node.setdefault('extras', {})['dtsCel'] = ';'.join(parts)
+        tagged += 1
+
+    if not tagged:
+        log("  !! no glTF node matched a .dts object with cel tracks -- visibility/"
+            "frame animation is LOST (objects: {})".format(sorted(tracks)[:6]))
+        return
+
+    new_json = json.dumps(js, separators=(',', ':')).encode('utf-8')
+    while len(new_json) % 4:
+        new_json += b' '
+    out = bytearray()
+    for ctype, payload in chunks:
+        body = new_json if ctype == b'JSON' else payload
+        if ctype != b'JSON':
+            while len(body) % 4:
+                body = body + b'\x00'
+        out += struct.pack('<I4s', len(body), ctype) + body
+    with open(path, 'wb') as f:
+        f.write(struct.pack('<4sII', b'glTF', 2, 12 + len(out)) + bytes(out))
+
+    log("cel extras: {} of {} object(s) with tracks carried, {} keyframe(s)"
+        .format(tagged, len(tracks), keys_out))
+    if unmatched:
+        log("  note: {} object(s) with cel tracks have no node in the GLB (dropped "
+            "by --one-lod): {}".format(len(unmatched), unmatched[:6]))
+    if refused:
+        log("  !! {} object(s) REFUSED -- a name contains an encoding delimiter "
+            "({!r}): {}".format(len(refused), _CEL_DELIMS, refused[:4]))
+
+
 def inject_sequence_extras(path, cyclic_of, prio_of):
     """Carry the .dts's authored fCyclic / fPriority into the GLB as animation extras.
 
@@ -1769,6 +2023,22 @@ def main():
     reorder_animations(dst, seq_names if parsed else None)
     inject_sequence_extras(dst, cyclic_of, prio_of)
     inject_material_extras(dst, dts_material_maps(src))
+
+    # Cel tracks last -- they key off the FINAL node list, and they carry sequence
+    # NAMES, so they must be written after reorder_animations has settled the order.
+    cel_tracks, cel_seqnames = dts_cel_tracks(src)
+    if cel_seqnames is not None and parsed and seq_names is not None:
+        # ★Cross-check the two independent .dts walks against each other.★  This
+        # function repeats the header/table offset arithmetic that
+        # dts_sequence_owner_counts does, and two copies of the same arithmetic is
+        # exactly how a silent divergence starts.  If they ever disagree about the
+        # sequence table, say so and drop the cel tracks rather than write keys bound
+        # to the wrong sequence names.
+        if list(cel_seqnames) != list(seq_names):
+            log("  !! cel-track parse disagrees with the sequence-table parse "
+                "({} vs {}) -- cel tracks dropped".format(cel_seqnames, seq_names))
+            cel_tracks = None
+    inject_cel_extras(dst, cel_tracks)
 
     names, js, raw, bin_off = glb_animation_names(dst)
     log("---- GLB ----")
