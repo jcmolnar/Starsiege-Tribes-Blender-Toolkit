@@ -538,6 +538,16 @@ def retime_strip(strip, fs, fe, dts_dur, fps, closes):
     return strip
 
 
+# Node names the ENGINE resolves by name, so they are mount/reference points rather than
+# scenery and must never be repurposed as an animation host.  ★Measured, not guessed --
+# this is the same list tools/check_sequence_contract.py gates on★ (turret.cpp:216-217
+# findNode("dummy eye")/findNode("dummy muzzle"), plus the player/vehicle mounts).  Kept
+# lower-case; is_engine_node() also matches per-detail variants like "dummy eye 25".
+ENGINE_MOUNT_NAMES = ("collision", "dummy exit", "dummy eye", "dummy muzzle",
+                      "dummyalways chasecam", "dummyalways muzzle", "dummyalways root",
+                      "kill")
+
+
 def build_nla_tracks(ranges, count_of, dur_of, fps, owned):
     """One NLA track per sequence, per animated object, each strip referencing
     that sequence's sub-range of the object's single imported action.
@@ -637,7 +647,14 @@ def build_nla_tracks(ranges, count_of, dur_of, fps, owned):
         parents = set(o.parent.name for o in bpy.data.objects if o.parent)
 
         def inert_rank(o):
+            # 'bounds' is the ideal host: it is the bbox node, it is never a mount, and
+            # nothing reads its animated transform.  It is usually the tree ROOT, so the
+            # old leaf-only filter excluded it and pushed the choice onto whatever leaf
+            # sorted first -- which is how a turret's 'dummy eye' got picked.  Hosting a
+            # parent is safe HERE because the action authored below is CONSTANT (two keys
+            # of the host's own rest location), so no subtree moves.
             return (o.name.lower() != 'bounds',      # prefer the bbox node
+                    o.name in parents,               # then a leaf over a parent
                     o.type == 'MESH',                # then any non-mesh
                     o.name.lower() not in ('cam', 'coll0'))
 
@@ -648,8 +665,28 @@ def build_nla_tracks(ranges, count_of, dur_of, fps, owned):
         # an action left to borrow -- no host, name dropped, conversion fails with
         # "no inert host was found".  64 shapes in the 823-shape corpus are cel-only.
         # A host without an action now gets a purpose-built constant one below.
-        hosts = [o for o in bpy.data.objects
-                 if o.name not in parents]           # leaf only: moving a parent moves its subtree
+        #
+        # ★NEVER host on a node the ENGINE RESOLVES BY NAME.★  These are mount points and
+        # camera/muzzle references, not scenery: turret.cpp:216-217 does
+        # findNode("dummy eye") for the turret camera and findNode("dummy muzzle") for the
+        # gun, player/vehicle code does the same for its own mounts.  Parking a track on
+        # one makes an engine-critical node a puppet of an unrelated sequence.
+        # mortar_turret.glb shipped exactly that: its cel-only 'visibility' sequence was
+        # parked on 'dummy eye', the turret's camera node.  ★The list below is the SAME one
+        # tools/check_sequence_contract.py already measured and gates on -- I had the data
+        # and simply never applied it here.★
+        def is_engine_node(nm):
+            low = (nm or "").strip().lower()
+            for base in ENGINE_MOUNT_NAMES:
+                if low == base:
+                    return True
+                if low.startswith(base):
+                    tail = low[len(base):].strip()
+                    if tail and tail.isdigit():   # per-detail variant, e.g. "dummy eye 25"
+                        return True
+            return False
+
+        hosts = [o for o in bpy.data.objects if not is_engine_node(o.name)]
         hosts.sort(key=inert_rank)
         for name in orphans:
             si = [i for i, (n, _, _) in enumerate(ranges) if n == name][0]
@@ -658,22 +695,19 @@ def build_nla_tracks(ranges, count_of, dur_of, fps, owned):
             for host in hosts:
                 if not host.animation_data:
                     host.animation_data_create()
-                act = next((s.action for t in host.animation_data.nla_tracks
-                            for s in t.strips if s.action), None)
+                # ★ALWAYS author a fresh CONSTANT action; never borrow an existing one.★
+                # Borrowing was how a parked sequence could carry real motion, and now
+                # that a PARENT may be the host (see inert_rank) borrowing would drag its
+                # whole subtree.  Two keys of the host's own rest location cannot move
+                # anything, which is what makes the parent case safe.  keyframe_insert
+                # rather than action.fcurves.new so this survives the 4.4+ slotted-action
+                # refactor that moved an Action's channels into layers/slots.
+                for f in (fs, fe):
+                    host.keyframe_insert(data_path="location", frame=int(f))
+                act = host.animation_data.action
                 if not act:
-                    # Author a constant two-key action on the host's own location.  Going
-                    # through keyframe_insert rather than action.fcurves.new keeps this
-                    # working across the 4.4+ slotted-action refactor, where an Action's
-                    # channels moved into layers/slots.
-                    for f in (fs, fe):
-                        host.keyframe_insert(data_path="location", frame=int(f))
-                    act = host.animation_data.action
-                    if not act:
-                        continue
-                    host.animation_data.action = None
-                    log("  authored a constant action on '{}' to host orphan "
-                        "sequence(s) -- this shape animates objects, not nodes"
-                        .format(host.name))
+                    continue
+                host.animation_data.action = None
                 track = host.animation_data.nla_tracks.new()
                 track.name = name
                 strip = track.strips.new(name, 0, act)
@@ -687,8 +721,9 @@ def build_nla_tracks(ranges, count_of, dur_of, fps, owned):
                              closes.get(name, False))
                 per_seq[name] = 1
                 placed = True
-                log("  '{}' owns no nodes in the DTS -- parked on inert leaf '{}' "
-                    "to keep the sequence NAME (glTF needs >=1 channel)".format(name, host.name))
+                log("  '{}' owns no nodes in the DTS -- parked on inert node '{}' with a "
+                    "CONSTANT action to keep the sequence NAME (glTF needs >=1 channel)"
+                    .format(name, host.name))
                 break
             if not placed:
                 log("  !! '{}' owns no nodes and no inert host was found -- the name "
