@@ -781,10 +781,42 @@ class ImportDTS(bpy.types.Operator, ImportHelper):
                 elif hasattr(shape_data, 'objects_v7'):
                     objects = shape_data.objects_v7
 
+                # Version 6 and below store a FLOAT quaternion, so V6Transform is 40
+                # bytes against V7Transform's 32 (ts_transform.h:31-37 vs :170-176).
+                # Both the parser and this selector used to stop at v7, which left
+                # `transforms` empty for a v5/v6 shape and failed as an IndexError on
+                # `transforms[nodes[0].default_transform]` rather than as anything
+                # that named the version.
                 if hasattr(shape_data, 'transforms'):
                     transforms = shape_data.transforms
                 elif hasattr(shape_data, 'transforms_v7'):
                     transforms = shape_data.transforms_v7
+                elif hasattr(shape_data, 'transforms_v6'):
+                    # ★A v6 rotation is already a FLOAT quaternion, but every consumer
+                    # below runs it through short2float (x / 0x7FFF) because v7/v8 store
+                    # Quat16.★  Feeding the raw floats straight in would silently shrink
+                    # every rotation by 32767 -- a wrong model that still loads, which is
+                    # the worst failure mode.  Rather than edit six call sites and risk
+                    # the v7/v8 path that 814 of 823 shapes depend on, pre-scale here so
+                    # short2float recovers the original value exactly (Python floats are
+                    # doubles, so multiply-then-divide by the same constant round-trips).
+                    # NB no explicit `(object)` base: this function assigns a local named
+                    # `object` further down, which shadows the builtin for the WHOLE
+                    # function scope, so naming it here is an UnboundLocalError.
+                    class _Q:
+                        def __init__(self, q):
+                            self.x = q.x * 0x7FFF
+                            self.y = q.y * 0x7FFF
+                            self.z = q.z * 0x7FFF
+                            self.w = q.w * 0x7FFF
+
+                    class _T:
+                        def __init__(self, t):
+                            self.rotate = _Q(t.rotate)
+                            self.translate = t.translate
+                            self.scale = t.scale
+
+                    transforms = [_T(t) for t in shape_data.transforms_v6]
 
                 if hasattr(shape_data, 'nodes'):
                     nodes = shape_data.nodes

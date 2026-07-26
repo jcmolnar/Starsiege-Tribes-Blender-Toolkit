@@ -1912,9 +1912,32 @@ def main():
     log("DTS sequences from timeline markers: {}".format(
         [(n, s, e) for n, s, e in ranges]))
     if not ranges:
-        log("!! no sequence markers found -- the GLB would carry node-named clips,")
-        log("!! which the engine cannot bind (see this file's header). Aborting.")
-        return 6
+        # ★"No markers" has TWO causes and they need opposite handling.★  The dangerous
+        # one is markers going missing on a shape that HAS sequences -- Blender then names
+        # clips after NODES and the engine, which binds by name, silently binds nothing.
+        # But a shape with NO SEQUENCES AT ALL has no markers legitimately, and aborting
+        # on it refused 318 of the 823-shape corpus (38.6%) -- every static prop, every
+        # editor primitive, and `car.dts`, a real vehicle.  Ask the .dts which case this
+        # is instead of assuming the bad one.  ts_gltf handles a zero-animation GLB
+        # natively (buildAnimations returns early on !animations_count).
+        n_dts_seq = None
+        try:
+            with open(src, 'rb') as f:
+                raw = f.read()
+            at = raw.find(b"TS::Shape")
+            if at >= 0:
+                n_dts_seq = struct.unpack_from("<i", raw, at + 10 + 8)[0]
+        except Exception:
+            n_dts_seq = None
+        if n_dts_seq == 0:
+            log("no sequence markers, and the .dts declares 0 sequences -- this shape is "
+                "genuinely STATIC, so there is nothing to lose.  Converting geometry only.")
+        else:
+            log("!! no sequence markers found, but the .dts declares {} sequence(s) -- the "
+                "GLB would carry node-named clips,".format(
+                    "an unknown number of" if n_dts_seq is None else n_dts_seq))
+            log("!! which the engine cannot bind (see this file's header). Aborting.")
+            return 6
 
     parsed = dts_sequence_owner_counts(src)
     if parsed is None:

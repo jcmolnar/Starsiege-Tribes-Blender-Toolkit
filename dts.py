@@ -492,7 +492,12 @@ class Dts(KaitaiStruct):
             if self._parent.version >= 8:
                 self.bounds = Dts.Box3f(self._io, self, self._root)
 
-            if self._parent.version == 7:
+            # ★`== 7` meant a version-5 or -6 shape read NO NODES AT ALL★, leaving the
+            # stream num_nodes * 20 bytes short so the next PERS block landed on garbage
+            # and the mesh Section fell through to Dummy -- surfacing as the useless
+            # "'Dummy' object has no attribute 'obj_data'".  The engine reads the SAME
+            # 20-byte record for every version <= 7 (`oldNodesV7`, ts_shape.cpp:1154-1157).
+            if self._parent.version <= 7:
                 self.nodes_v7 = [None] * (self.num_nodes)
                 for i in range(self.num_nodes):
                     self.nodes_v7[i] = Dts.Nodev7(self._io, self, self._root)
@@ -543,6 +548,14 @@ class Dts(KaitaiStruct):
                 for i in range(self.num_transforms):
                     self.transforms_v7[i] = Dts.Transformv7(self._io, self, self._root)
 
+            # Second half of the same gap: below 7 the quaternion is FLOAT, so the record
+            # is 40 bytes rather than 32 (ts_transform.h:31-37).  Missing it drifted
+            # microex by a further num_transforms * 40.
+            if self._parent.version < 7:
+                self.transforms_v6 = [None] * (self.num_transforms)
+                for i in range(self.num_transforms):
+                    self.transforms_v6[i] = Dts.Transformv6(self._io, self, self._root)
+
 
             self.names = [None] * (self.num_names)
             for i in range(self.num_names):
@@ -574,6 +587,16 @@ class Dts(KaitaiStruct):
                 self.transitions_v7 = [None] * (self.num_transitions)
                 for i in range(self.num_transitions):
                     self.transitions_v7[i] = Dts.Transitionv7(self._io, self, self._root)
+
+            # The engine switches transitions at `version < 7` (ts_shape.cpp:1145-1148),
+            # and V6Transition embeds a V6Transform so it is 60 bytes, not 40.  Every
+            # v5/v6 shape in the 823-shape corpus happens to carry ZERO transitions, so
+            # this path is untested by real data -- it is here so the layout is correct
+            # by construction rather than correct by luck.
+            if self._parent.version < 7:
+                self.transitions_v6 = [None] * (self.num_transitions)
+                for i in range(self.num_transitions):
+                    self.transitions_v6[i] = Dts.Transitionv6(self._io, self, self._root)
 
 
             self.frame_triggers = [None] * (self.num_frametriggers)
@@ -752,6 +775,55 @@ class Dts(KaitaiStruct):
                 self.m[i] = self._io.read_f4le()
 
             self.p = Dts.Point3f(self._io, self, self._root)
+
+
+    class Quatf(KaitaiStruct):
+        """A FLOAT quaternion -- what shape version 6 and below store.  Version 7
+        narrowed it to Quat16 (ts_transform.h:31-37 vs :170-176), so V6Transform is 40
+        bytes where V7Transform is 32."""
+        def __init__(self, _io, _parent=None, _root=None):
+            self._io = _io
+            self._parent = _parent
+            self._root = _root if _root else self
+            self._read()
+
+        def _read(self):
+            self.x = self._io.read_f4le()
+            self.y = self._io.read_f4le()
+            self.z = self._io.read_f4le()
+            self.w = self._io.read_f4le()
+
+
+    class Transformv6(KaitaiStruct):
+        """V6Transform: QuatF + Point3F + Point3F = 40 bytes (ts_transform.h:31-37)."""
+        def __init__(self, _io, _parent=None, _root=None):
+            self._io = _io
+            self._parent = _parent
+            self._root = _root if _root else self
+            self._read()
+
+        def _read(self):
+            self.rotate = Dts.Quatf(self._io, self, self._root)
+            self.translate = Dts.Point3f(self._io, self, self._root)
+            self.scale = Dts.Point3f(self._io, self, self._root)
+
+
+    class Transitionv6(KaitaiStruct):
+        """V6Transition: 2 Int32 + 3 RealF + V6Transform = 60 bytes
+        (ts_shape.cpp:923-932).  The engine switches at `version < 7`."""
+        def __init__(self, _io, _parent=None, _root=None):
+            self._io = _io
+            self._parent = _parent
+            self._root = _root if _root else self
+            self._read()
+
+        def _read(self):
+            self.start_sequence = self._io.read_u4le()
+            self.end_sequence = self._io.read_u4le()
+            self.start_position = self._io.read_f4le()
+            self.end_position = self._io.read_f4le()
+            self.duration = self._io.read_f4le()
+            self.transform = Dts.Transformv6(self._io, self, self._root)
 
 
     class Transformv7(KaitaiStruct):
