@@ -1178,10 +1178,22 @@ def dts_material_maps(path):
     wrong.  Every candidate is validated (each fMapFile must be NUL-padded ASCII or all
     zeros) and the one that actually names textures wins.
     """
-    REC, MAP_OFF, MAP_LEN = 60, 16, 32
+    # ★The record size is VERSIONED, and assuming one value silently loses textures.★
+    # Material::read (ts_material.cpp:276-295) reads a different byte count per version:
+    # v1/v2 drop fType/fElasticity/fFriction/fUseDefaultProps, v3 drops only
+    # fUseDefaultProps, v4+ reads the whole 64-byte Params.  I hardcoded 60 after
+    # reading that very function, and it produced a clean-looking FALSE NEGATIVE:
+    # hvarmor, Vyper, newflyer, mortar_turret and gunturet all reported "no materials"
+    # and would have shipped as untextured, when in fact they carry
+    # base.larmor.BMP / VyperSkin_B.bmp / flyer.BMP / base_tex.BMP / turbase.bmp at
+    # record sizes 64 and 48.  Try each layout and keep the best-scoring one; the
+    # NUL-padded-ASCII validation is what makes that safe rather than a guess.
+    LAYOUTS = ((60, 16, 32), (64, 16, 32), (48, 16, 32), (48, 16, 16))
     NULB = b"\x00"
 
-    def plausible(b):
+    def plausible(b, n):
+        if len(b) < n:
+            return False
         z = b.find(NULB)
         if z < 0:
             return False
@@ -1197,26 +1209,29 @@ def dts_material_maps(path):
     if start < 0:
         start = 0
     best = None
-    for off in range(start, len(raw) - 8):
-        nDet, nMat = struct.unpack_from("<ii", raw, off)
-        if not (1 <= nDet <= 32 and 1 <= nMat <= 512):
-            continue
-        total = nDet * nMat
-        if off + 8 + total * REC > len(raw):
-            continue
-        maps, ok = [], True
-        for m in range(total):
-            base = off + 8 + m * REC
-            fld = raw[base + MAP_OFF:base + MAP_OFF + MAP_LEN]
-            if not plausible(fld):
-                ok = False
-                break
-            maps.append(fld.split(NULB)[0].decode('latin1'))
-        if not ok:
-            continue
-        named = sum(1 for m in maps if m)
-        if best is None or (named, total) > best[0]:
-            best = ((named, total), maps)
+    for (REC, MAP_OFF, MAP_LEN) in LAYOUTS:
+        for off in range(start, len(raw) - 8):
+            nDet, nMat = struct.unpack_from("<ii", raw, off)
+            if not (1 <= nDet <= 32 and 1 <= nMat <= 512):
+                continue
+            total = nDet * nMat
+            if off + 8 + total * REC > len(raw):
+                continue
+            maps, ok = [], True
+            for m in range(total):
+                base = off + 8 + m * REC
+                fld = raw[base + MAP_OFF:base + MAP_OFF + MAP_LEN]
+                if not plausible(fld, MAP_LEN):
+                    ok = False
+                    break
+                maps.append(fld.split(NULB)[0].decode('latin1'))
+            if not ok:
+                continue
+            named = sum(1 for m in maps if m)
+            # Require at least one NAMED map: an all-empty candidate is almost always a
+            # run of zeros elsewhere in the file rather than the real material list.
+            if named and (best is None or (named, total) > best[0]):
+                best = ((named, total), maps)
     return best[1] if best else None
 
 
