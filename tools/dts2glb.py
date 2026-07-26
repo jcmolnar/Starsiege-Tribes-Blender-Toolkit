@@ -1119,6 +1119,138 @@ def reorder_animations(path, seq_names):
             "after the contracted range: {}".format(len(extra), [a.get('name') for a in extra]))
 
 
+def dts_material_maps(path):
+    """Each .dts material's fMapFile, indexed by DTS material index.
+
+    ★The texture NAME is lost between the .dts and the .glb.★  The importer names
+    Blender materials "<file>.<index>" (main.py:833) and wires no image, so the exported
+    glTF material carries no base_color_texture -- and ts_gltf then falls back to a flat
+    colour (MatRGB, ts_gltf.cpp:757-761).  ★Every converted shape has therefore rendered
+    UNTEXTURED★; it is only obvious on a character, because a mech's panels are mostly
+    flat-coloured in the .dts anyway (tr_talon: 3 of 21 materials textured).
+
+    ★The fix must carry the NAME, never an embedded image.★  `base.larmor.BMP` is the
+    Tribes skin convention <skinbase>.<armour>.BMP and the engine rewrites that prefix
+    per player at runtime, so baking the texture into the .glb would freeze one armour
+    appearance and break skin swapping outright.
+
+    Format, from the engine's own serialiser:
+      MaterialList::read  (ts_material.cpp:578)  Int32 fnDetails, Int32 fnMaterials,
+                          then fnDetails*fnMaterials records
+      Material::write     (ts_material.cpp:299)  sizeof(Params) minus fUseDefaultProps
+                          = 60 bytes
+      Params              (ts_material.h:172-189) fMapFile[32] at offset 16
+
+    Located by SIGNATURE rather than by summing the preceding tables: objects, details,
+    transitions and frameTriggers all sit in between, each version- and
+    alignment-dependent, so an offset chain would have four chances to be silently
+    wrong.  Every candidate is validated (each fMapFile must be NUL-padded ASCII or all
+    zeros) and the one that actually names textures wins.
+    """
+    REC, MAP_OFF, MAP_LEN = 60, 16, 32
+    NULB = b"\x00"
+
+    def plausible(b):
+        z = b.find(NULB)
+        if z < 0:
+            return False
+        if z == 0:
+            return all(c == 0 for c in b)
+        return all(32 <= c <= 126 for c in b[:z]) and all(c == 0 for c in b[z:])
+
+    try:
+        raw = open(path, 'rb').read()
+    except Exception:
+        return None
+    start = raw.find(b"TS::Shape")
+    if start < 0:
+        start = 0
+    best = None
+    for off in range(start, len(raw) - 8):
+        nDet, nMat = struct.unpack_from("<ii", raw, off)
+        if not (1 <= nDet <= 32 and 1 <= nMat <= 512):
+            continue
+        total = nDet * nMat
+        if off + 8 + total * REC > len(raw):
+            continue
+        maps, ok = [], True
+        for m in range(total):
+            base = off + 8 + m * REC
+            fld = raw[base + MAP_OFF:base + MAP_OFF + MAP_LEN]
+            if not plausible(fld):
+                ok = False
+                break
+            maps.append(fld.split(NULB)[0].decode('latin1'))
+        if not ok:
+            continue
+        named = sum(1 for m in maps if m)
+        if best is None or (named, total) > best[0]:
+            best = ((named, total), maps)
+    return best[1] if best else None
+
+
+def inject_material_extras(path, map_of):
+    """Carry each material's .dts fMapFile into the GLB as material extras.
+
+    The glTF material NAME is "<file>.<dtsIndex>", so its trailing integer recovers
+    which .dts material it came from.  That matters: tr_talon exports 16 glTF materials
+    against 21 in the .dts, so the correspondence is NOT positional."""
+    if not map_of:
+        return
+    with open(path, 'rb') as f:
+        data = f.read()
+    if data[0:4] != b'glTF':
+        return
+    off, chunks, js = 12, [], None
+    while off + 8 <= len(data):
+        clen, ctype = struct.unpack_from('<I4s', data, off)
+        off += 8
+        chunk = data[off:off + clen]
+        off += clen
+        if ctype == b'JSON':
+            js = json.loads(chunk.decode('utf-8'))
+            chunks.append([ctype, None])
+        else:
+            chunks.append([ctype, chunk])
+    if js is None or not js.get('materials'):
+        return
+
+    tagged, unmatched = 0, []
+    for m in js['materials']:
+        idx = trailing_int(m.get('name'))
+        if idx is None or not (0 <= idx < len(map_of)):
+            unmatched.append(m.get('name'))
+            continue
+        if not map_of[idx]:
+            continue                    # genuinely flat-coloured in the .dts
+        m.setdefault('extras', {})['dtsMapFile'] = map_of[idx]
+        tagged += 1
+
+    if not tagged:
+        log("  !! no material matched a .dts map file -- textures stay flat")
+        return
+
+    new_json = json.dumps(js, separators=(',', ':')).encode('utf-8')
+    while len(new_json) % 4:
+        new_json += b' '
+    out = bytearray()
+    for ctype, payload in chunks:
+        body = new_json if ctype == b'JSON' else payload
+        if ctype != b'JSON':
+            while len(body) % 4:
+                body = body + b'\x00'
+        out += struct.pack('<I4s', len(body), ctype) + body
+    with open(path, 'wb') as f:
+        f.write(struct.pack('<4sII', b'glTF', 2, 12 + len(out)) + bytes(out))
+
+    named = sorted(set(x for x in map_of if x))
+    log("material extras: {} of {} material(s) carry a .dts map file {}"
+        .format(tagged, len(js['materials']), named[:6]))
+    if unmatched:
+        log("  note: {} material name(s) had no trailing .dts index: {}"
+            .format(len(unmatched), unmatched[:4]))
+
+
 def inject_sequence_extras(path, cyclic_of, prio_of):
     """Carry the .dts's authored fCyclic / fPriority into the GLB as animation extras.
 
@@ -1590,6 +1722,7 @@ def main():
     # Reorder BEFORE the extras so the extras land on the final animation list.
     reorder_animations(dst, seq_names if parsed else None)
     inject_sequence_extras(dst, cyclic_of, prio_of)
+    inject_material_extras(dst, dts_material_maps(src))
 
     names, js, raw, bin_off = glb_animation_names(dst)
     log("---- GLB ----")
