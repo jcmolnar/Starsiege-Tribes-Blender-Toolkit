@@ -42,9 +42,14 @@ import sys
 
 MAX_SEQUENCE_INDEX = 16          # shapebase.h:21-29
 LOAD_BEARING = ("power", "activate", "use", "deploy", "root")
-ENGINE_MOUNT_NAMES = ("collision", "dummy exit", "dummy eye", "dummy muzzle",
-                      "dummyalways chasecam", "dummyalways muzzle",
-                      "dummyalways root", "kill 15")
+# Engine mount names come from the ONE shared classifier.  The tuple that used to be
+# duplicated here said "kill 15" while tools/dts2glb.py's copy said "kill" -- neither is
+# an engine mount at all (turret.cpp:120 is commented out), and both were missing every
+# name in player.cpp's mount table and both numbered families.
+import os as _os
+sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import engine_mount_contract as emc
+ENGINE_MOUNT_NAMES = emc.EXACT_MOUNTS
 NUL = b"\x00"                    # named, so no escaping layer can mangle it
 
 

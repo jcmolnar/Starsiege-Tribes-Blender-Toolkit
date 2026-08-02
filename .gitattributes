@@ -1,0 +1,18 @@
+# The repo stores text as LF. Windows editors flip working-tree files to CRLF,
+# which turns a 900-line change into a 5,000-line whole-file rewrite in every
+# diff (and hides the real edit). text=auto normalizes on the way INTO the index
+# and leaves the working tree alone, so both platforms stay happy.
+* text=auto
+
+# Binary payloads must never be touched: a single LF/CRLF substitution inside a
+# GLB/DTS chunk corrupts it silently.
+*.glb  binary
+*.gltf binary
+*.dts  binary
+*.DTS  binary
+*.blend binary
+*.png  binary
+*.bmp  binary
+*.tga  binary
+*.pcx  binary
+*.zip  binary

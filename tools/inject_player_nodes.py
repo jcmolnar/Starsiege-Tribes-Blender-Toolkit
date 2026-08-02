@@ -69,23 +69,34 @@ def clean(b):
     return b.split(b'\x00')[0].decode('latin-1', 'replace')
 
 
-def fix_winding(buf):
-    """Reverse faces of meshes wound opposite the model majority.
+def fix_winding(buf, verbose=False):
+    """Make every mesh's face winding internally consistent and outward.
 
-    Returns (new_bytes, meshes_flipped, flipped_names). Starsiege ships some
-    meshes wound the other way (the Herc cockpit canopy is CCW while the rest
-    of the mech is CW); Tribes' clockwise-front backface cull renders those
-    inside-out, so they read as see-through from outside. This detects each
-    mesh's winding (cross-product face normal vs outward-from-centroid, in
-    mesh-local frame-0 space -- rigid node transforms preserve the sign) and,
-    for meshes disagreeing with the model majority, swaps each face's vip[1]
-    and vip[2] (8-byte vertex/texture-index pairs). Swapping the pair reverses
-    the vertex order AND the UVs together, so the texture stays put.
+    Returns (new_bytes, faces_flipped, flipped_names). Tribes backface-culls
+    clockwise-front, so a face wound the wrong way renders inside-out and reads
+    as see-through from outside. Starsiege models (drawn two-sided) carry two
+    problems a whole-mesh majority vote can't fix: the cockpit canopy is wound
+    opposite the body AND has a couple of stray faces that disagree with its own
+    bulk. So instead of voting per mesh, this rebuilds each mesh's winding the
+    way Blender's "recalculate outside" does:
 
-    Meshes live as separate CelAnimMesh PERS sections after the shape, so we
-    can't offset into them from the shape header; instead we monkeypatch
-    Dts.Face to record each face's absolute byte offset during a parse (faces
-    are read only from meshes, in mesh order), then patch those offsets.
+      1. Weld vertices by frame-0 position (UV seams split a shared edge into
+         two vertex indices; welding rejoins them for adjacency).
+      2. Flood-fill each connected component so neighbouring faces traverse
+         their shared edge in OPPOSITE directions (the manifold-consistency
+         rule) -- this makes the whole component agree with itself.
+      3. Orient each closed component by its signed volume: flip the component
+         wholesale if its outward normals point the wrong way relative to the
+         model's dominant convention (measured from the big, unambiguous body
+         meshes). Open/flat components (|volume|~0) are left as-is -- a single
+         layer of faces has no inside to be see-through.
+
+    A face is reversed by swapping its vip[1]/vip[2] (8-byte vertex+texture
+    pairs), which flips vertex order AND UVs together so the texture stays put.
+    Meshes are separate CelAnimMesh PERS sections after the shape, so we can't
+    offset into them from the shape header; we monkeypatch Dts.Face to record
+    each face's absolute byte offset during one parse (faces are read only from
+    meshes, in mesh order), then patch those offsets in place.
     """
     import dts as _dtsmod
     face_off = []
@@ -110,54 +121,6 @@ def fix_winding(buf):
     def dot(a, b):
         return a[0]*b[0]+a[1]*b[1]+a[2]*b[2]
 
-    # per-mesh dominant winding sign: True = "outward" (CCW by the cross test)
-    signs = []
-    fi = 0
-    per_mesh_faceoff = []
-    for m in d.meshes:
-        nf = m.num_faces
-        offs = face_off[fi:fi + nf]
-        fi += nf
-        per_mesh_faceoff.append(offs)
-        fr = m.frames[0]
-        sc = (fr.scale.x, fr.scale.y, fr.scale.z)
-        og = (fr.origin.x, fr.origin.y, fr.origin.z)
-        first = fr.first_vert
-        nvpf = m.num_vertices_per_frame
-
-        def lv(local_idx):
-            v = m.vertices[first + local_idx]
-            return (v.x*sc[0]+og[0], v.y*sc[1]+og[1], v.z*sc[2]+og[2])
-
-        if not nf or not nvpf:
-            signs.append(None)
-            continue
-        pts = [lv(k) for k in range(nvpf)]
-        cen = (sum(p[0] for p in pts)/nvpf,
-               sum(p[1] for p in pts)/nvpf,
-               sum(p[2] for p in pts)/nvpf)
-        out = inn = 0
-        for f in m.faces:
-            p0 = lv(f.vip[0].vertex_index)
-            p1 = lv(f.vip[1].vertex_index)
-            p2 = lv(f.vip[2].vertex_index)
-            n = cross(sub(p1, p0), sub(p2, p0))
-            fc = ((p0[0]+p1[0]+p2[0])/3, (p0[1]+p1[1]+p2[1])/3,
-                  (p0[2]+p1[2]+p2[2])/3)
-            if dot(n, sub(fc, cen)) >= 0:
-                out += 1
-            else:
-                inn += 1
-        signs.append(out > inn)
-
-    real = [s for s in signs if s is not None]
-    if not real:
-        return buf, 0, []
-    majority = sum(real) >= len(real) / 2.0    # True if most meshes are "outward"
-    out = bytearray(buf)
-    flipped = 0
-    names = []
-    # object names for reporting (objects reference meshes by index)
     sh = d.shape.data.obj_data
     mesh_name = {}
     objs = getattr(sh, 'objects_v7', None) or getattr(sh, 'objects', [])
@@ -165,17 +128,143 @@ def fix_winding(buf):
         mesh_name.setdefault(o.mesh_index,
                              clean(sh.names[o.name]) if o.name < len(sh.names) else '?')
 
-    for mi, sign in enumerate(signs):
-        if sign is None or sign == majority:
+    # ---- pass 1: per mesh, resolve consistent winding + component volumes ----
+    # We defer the global "which sign is outward" decision until we've seen the
+    # big body meshes, so collect each mesh's per-component signed volume under
+    # the flood-filled (self-consistent) orientation, tagged by component.
+    per_mesh = []          # dicts: {offs, flip(list bool), comp(list int), vol(list)}
+    fi = 0
+    model_vol = 0.0        # sum of component volumes, signed by consistent orient
+    for mi, m in enumerate(d.meshes):
+        nf = m.num_faces
+        offs = face_off[fi:fi + nf]
+        fi += nf
+        nvpf = m.num_vertices_per_frame
+        if not nf or not nvpf:
+            per_mesh.append(None)
             continue
-        for off in per_mesh_faceoff[mi]:
+        fr = m.frames[0]
+        sc = (fr.scale.x, fr.scale.y, fr.scale.z)
+        og = (fr.origin.x, fr.origin.y, fr.origin.z)
+        first = fr.first_vert
+
+        def lv(i):
+            v = m.vertices[first + i]
+            return (v.x*sc[0]+og[0], v.y*sc[1]+og[1], v.z*sc[2]+og[2])
+
+        # weld local vertex indices by rounded position
+        weld = {}
+        canon = [0]*nvpf
+        for i in range(nvpf):
+            p = lv(i)
+            key = (round(p[0], 4), round(p[1], 4), round(p[2], 4))
+            canon[i] = weld.setdefault(key, len(weld))
+
+        faces = []                          # (welded a,b,c) per face
+        for f in m.faces:
+            faces.append((canon[f.vip[0].vertex_index],
+                          canon[f.vip[1].vertex_index],
+                          canon[f.vip[2].vertex_index]))
+
+        # undirected edge -> list of (face_idx, oriented) where oriented=True if
+        # the face writes this edge as (min->max)
+        edge2f = {}
+        for k, (a, b, c) in enumerate(faces):
+            for u, v in ((a, b), (b, c), (c, a)):
+                key = (u, v) if u < v else (v, u)
+                edge2f.setdefault(key, []).append((k, u < v))
+
+        # flood fill: flip[k] toggles face k so all neighbours are opposite-dir
+        flip = [None]*nf
+        comp = [-1]*nf
+        ncomp = 0
+        for seed in range(nf):
+            if flip[seed] is not None:
+                continue
+            flip[seed] = False
+            comp[seed] = ncomp
+            stack = [seed]
+            while stack:
+                k = stack.pop()
+                a, b, c = faces[k]
+                for u, v in ((a, b), (b, c), (c, a)):
+                    key = (u, v) if u < v else (v, u)
+                    for (k2, or2) in edge2f.get(key, ()):
+                        if k2 == k:
+                            continue
+                        or1 = (u < v)
+                        # effective dir = written-dir XOR flip; want them opposite
+                        eff1 = or1 ^ flip[k]
+                        want2 = not eff1
+                        f2 = want2 ^ or2
+                        if flip[k2] is None:
+                            flip[k2] = f2
+                            comp[k2] = comp[k]
+                            stack.append(k2)
+                        # (conflicts on non-manifold edges: first assignment wins)
+            ncomp += 1
+
+        # per-component signed volume under the flood-filled orientation
+        pts_all = [lv(i) for i in range(nvpf)]
+        cen = (sum(p[0] for p in pts_all)/nvpf,
+               sum(p[1] for p in pts_all)/nvpf,
+               sum(p[2] for p in pts_all)/nvpf)
+        cvol = [0.0]*ncomp
+        for k, (a, b, c) in enumerate(faces):
+            p0 = lv(m.faces[k].vip[0].vertex_index)
+            p1 = lv(m.faces[k].vip[1].vertex_index)
+            p2 = lv(m.faces[k].vip[2].vertex_index)
+            if flip[k]:
+                p1, p2 = p2, p1
+            A = sub(p0, cen); B = sub(p1, cen); C = sub(p2, cen)
+            cvol[comp[k]] += dot(A, cross(B, C))
+        for k in range(nf):
+            model_vol += (dot(sub(lv(m.faces[k].vip[0].vertex_index), cen),
+                              cross(sub(lv(m.faces[k].vip[1].vertex_index if not flip[k]
+                                          else m.faces[k].vip[2].vertex_index), cen),
+                                    sub(lv(m.faces[k].vip[2].vertex_index if not flip[k]
+                                          else m.faces[k].vip[1].vertex_index), cen))))
+        per_mesh.append({'offs': offs, 'flip': flip, 'comp': comp, 'cvol': cvol,
+                         'name': mesh_name.get(mi, 'mesh%d' % mi)})
+
+    # ---- decide the model's outward sign, then finalise per-component flips ---
+    # model_vol is the summed signed volume with every component self-consistent
+    # but arbitrarily seeded; its sign is the body's dominant convention (the
+    # big leg/torso shells dominate the sum). A component whose own volume sign
+    # disagrees is inverted and gets flipped wholesale.
+    desired = 1.0 if model_vol >= 0 else -1.0
+
+    out = bytearray(buf)
+    faces_flipped = 0
+    names = []
+    for mi, pm in enumerate(per_mesh):
+        if pm is None:
+            continue
+        flip = pm['flip']; comp = pm['comp']; cvol = pm['cvol']
+        # component wholesale flip if its closed volume points the wrong way
+        comp_flip = []
+        # scale reference to judge "closed enough": biggest |cvol| in this mesh
+        vmax = max((abs(v) for v in cvol), default=0.0)
+        for ci, v in enumerate(cvol):
+            wrong = (v * desired) < 0 and abs(v) > 1e-3 * (vmax or 1) and abs(v) > 1e-6
+            comp_flip.append(wrong)
+        final = [flip[k] ^ comp_flip[comp[k]] for k in range(len(flip))]
+        n_here = 0
+        for k, off in enumerate(pm['offs']):
+            if not final[k]:
+                continue
             vip1 = bytes(out[off + 8:off + 16])
             vip2 = bytes(out[off + 16:off + 24])
             out[off + 8:off + 16] = vip2
             out[off + 16:off + 24] = vip1
-        flipped += 1
-        names.append(mesh_name.get(mi, 'mesh%d' % mi))
-    return bytes(out), flipped, names
+            n_here += 1
+        if n_here:
+            faces_flipped += n_here
+            names.append('%s(%d/%d)' % (pm['name'], n_here, len(pm['offs'])))
+            if verbose:
+                print('    winding: %-16s flipped %d/%d faces'
+                      % (pm['name'], n_here, len(pm['offs'])))
+    return bytes(out), faces_flipped, names
 
 
 class ShapeV7:

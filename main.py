@@ -1052,8 +1052,40 @@ class ImportDTS(bpy.types.Operator, ImportHelper):
                     array_val = [x, y, z]
                     array_verts_all.append(array_val)
 
+                # ★Degenerate faces hang Blender's edit-mode conversion -- drop them.★
+                #
+                # A .dts face whose three corners are the SAME vertex index (cy_goad and
+                # mg_goad carry 24 of them, e.g. head4 face (8,8,8)) is a zero-area
+                # triangle: the engine rasterises no pixels for it.  But feeding one to
+                # from_pydata and then entering edit mode makes bpy.ops.object.mode_set
+                # spin forever -- verified on a 4-vertex minimal repro where the ONLY
+                # difference between the run that returns and the run that never does is
+                # a single (0,0,0) face.  Left in, it burned 6.5 CPU-hours on one shape.
+                #
+                # Correlation over the 34-shape Herc set is exact: the only two shapes
+                # with degenerate faces are the only two that hang, and neither of the
+                # 32 clean shapes has any.
+                #
+                # Dropped, not repaired: there is no correct repair.  The face has no
+                # area and no winding, so nothing is lost visually -- but the count DOES
+                # change, so this is reported for the round-trip gate to account for,
+                # the same way redundantFaces already is.
+                _degenerate = set()
+                for _fi, _f in enumerate(mesh_data.faces):
+                    _vi = (_f.vip[0].vertex_index, _f.vip[1].vertex_index,
+                           _f.vip[2].vertex_index)
+                    if len(set(_vi)) < 3:
+                        _degenerate.add(_fi)
+                if _degenerate:
+                    print("  DEGENERATE: dropping {} zero-area face(s) from {} "
+                          "(indices {}) -- they would hang edit-mode conversion"
+                          .format(len(_degenerate), obj_name,
+                                  sorted(_degenerate)[:12]))
+
                 # Faces
-                for face in mesh_data.faces:
+                for _fi, face in enumerate(mesh_data.faces):
+                    if _fi in _degenerate:
+                        continue
                     store('geometry.faces.push( new THREE.Face3( {}, {}, {}, null, null, {} ) );'.format(
                         face.vip[0].vertex_index,
                         face.vip[1].vertex_index,
@@ -1093,7 +1125,12 @@ class ImportDTS(bpy.types.Operator, ImportHelper):
 
                 # Set up UVs
                 # store('geometry.faceVertexUvs = [[')
-                for face in mesh_data.faces:
+                # Must skip exactly the faces the geometry loop skipped: array_uvs is
+                # per-LOOP (3 entries per face) and is consumed by loop index, so a face
+                # dropped there but kept here shifts every subsequent UV by one corner.
+                for _fi, face in enumerate(mesh_data.faces):
+                    if _fi in _degenerate:
+                        continue
                     # store(' [ textureVerts[{}], textureVerts[{}], textureVerts[{}] ],'.format(
                     #     face.vip[0].texture_index, face.vip[1].texture_index, face.vip[2].texture_index
                     # ))

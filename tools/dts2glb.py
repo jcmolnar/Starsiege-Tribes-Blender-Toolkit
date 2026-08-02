@@ -90,6 +90,20 @@ import math
 import struct
 import traceback
 
+# The shared contract reader and extras writer live beside this script.  Blender is
+# launched with --python <abs path>, so sys.path[0] is not reliably tools/.
+_TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _TOOLS_DIR not in sys.path:
+    sys.path.insert(0, _TOOLS_DIR)
+
+# Output path, published for the failure-quarantine choke point at the bottom of this
+# file.  main() sets it as soon as the arguments are parsed, so any later failure --
+# including an uncaught exception -- can find the artifact it may have left behind.
+_DST = None
+import dts_contract
+import glb_contract_extras as gce
+import engine_mount_contract as emc
+
 ADDON_MODULE = "Tribes DTS Blender"   # folder name == module name
 IMPORT_OP_ID = "dynamix.dts"          # main.py:427  ImportDTS.bl_idname
 
@@ -106,9 +120,17 @@ def parse_args():
         raise SystemExit("expected: ... --python dts2glb.py -- <in.dts> <out.glb>")
     rest = argv[argv.index("--") + 1:]
     if len(rest) < 2:
-        raise SystemExit("expected 2 args after --: <in.dts> <out.glb> [--one-lod]")
+        raise SystemExit("expected 2 args after --: <in.dts> <out.glb> "
+                         "[--one-lod] [--allow-partial-twosided]")
     one_lod = any(a == "--one-lod" for a in rest[2:])
-    return os.path.abspath(rest[0]), os.path.abspath(rest[1]), one_lod
+    # ★An accepted loss must be NAMED, per asset, in the manifest.★  A generic "--lossy"
+    # would let any future loss ride in on a flag someone set for a different reason.
+    # This one flag accepts exactly one enumerated limitation: source faces that are
+    # two-sided inside an otherwise single-sided material, which glTF's per-material
+    # doubleSided cannot express.  Everything else still fails.
+    allow_partial_twosided = any(a == "--allow-partial-twosided" for a in rest[2:])
+    return (os.path.abspath(rest[0]), os.path.abspath(rest[1]), one_lod,
+            allow_partial_twosided)
 
 
 def check_addon_freshness():
@@ -538,14 +560,9 @@ def retime_strip(strip, fs, fe, dts_dur, fps, closes):
     return strip
 
 
-# Node names the ENGINE resolves by name, so they are mount/reference points rather than
-# scenery and must never be repurposed as an animation host.  ★Measured, not guessed --
-# this is the same list tools/check_sequence_contract.py gates on★ (turret.cpp:216-217
-# findNode("dummy eye")/findNode("dummy muzzle"), plus the player/vehicle mounts).  Kept
-# lower-case; is_engine_node() also matches per-detail variants like "dummy eye 25".
-ENGINE_MOUNT_NAMES = ("collision", "dummy exit", "dummy eye", "dummy muzzle",
-                      "dummyalways chasecam", "dummyalways muzzle", "dummyalways root",
-                      "kill")
+# NOTE: the ENGINE_MOUNT_NAMES tuple that used to live here is GONE.  The single source
+# of truth is tools/engine_mount_contract.py -- see the note at the orphan-hosting call
+# site for why two hand-maintained copies were worse than one.
 
 
 def build_nla_tracks(ranges, count_of, dur_of, fps, owned):
@@ -675,18 +692,16 @@ def build_nla_tracks(ranges, count_of, dur_of, fps, owned):
         # parked on 'dummy eye', the turret's camera node.  ★The list below is the SAME one
         # tools/check_sequence_contract.py already measured and gates on -- I had the data
         # and simply never applied it here.★
-        def is_engine_node(nm):
-            low = (nm or "").strip().lower()
-            for base in ENGINE_MOUNT_NAMES:
-                if low == base:
-                    return True
-                if low.startswith(base):
-                    tail = low[len(base):].strip()
-                    if tail and tail.isdigit():   # per-detail variant, e.g. "dummy eye 25"
-                        return True
-            return False
-
-        hosts = [o for o in bpy.data.objects if not is_engine_node(o.name)]
+        # Routed through the ONE shared classifier (tools/engine_mount_contract.py).
+        # This used to be a local re-implementation against a local ENGINE_MOUNT_NAMES
+        # tuple, and check_sequence_contract.py had a THIRD copy -- the two lists had
+        # already drifted (one said "kill", the other "kill 15", and both were missing
+        # every name in player.cpp's mount table plus both numbered families).
+        #
+        # isReserved() rather than resolves(): the cost here is asymmetric.  Refusing to
+        # host an orphan animation on one extra node costs nothing; hosting one on a real
+        # mount silently breaks it.
+        hosts = [o for o in bpy.data.objects if not emc.isReserved(o.name)]
         hosts.sort(key=inert_rank)
         for name in orphans:
             si = [i for i, (n, _, _) in enumerate(ranges) if n == name][0]
@@ -1206,7 +1221,25 @@ def reorder_animations(path, seq_names):
 
 
 def dts_material_maps(path):
-    """Each .dts material's fMapFile, indexed by DTS material index.
+    """RETIRED -- use tools/dts_contract.py.  Kept only as a record of the guess.
+
+    ★This located the material list by SIGNATURE, and that was never safe.★  It scanned
+    the entire file for any <nDetails,nMaterials> pair whose following bytes looked
+    plausible, tried four candidate record layouts, and required at least one NAMED map
+    file to reject false positives -- which meant a legitimately untextured shape could
+    not be read AT ALL.  It also recovered only fMapFile, so the other eight fields of
+    Material::Params were lost and the loader invented them from `alphaMode`.
+
+    None of that was necessary: the list announces itself.  Every Persistent block is
+    framed `'PERS' | Int32 size | Int16 nameLen | name | Int32 version | payload`, so
+    `TS::MaterialList` is a literal anchor and the version right after it gives the
+    record size outright.  dts_contract.readMaterials() does that instead.
+
+    Do not call this.  The body is left below only so the next reader can see what the
+    old heuristic actually did.
+
+    ---- original docstring ----
+    Each .dts material's fMapFile, indexed by DTS material index.
 
     ★The texture NAME is lost between the .dts and the .glb.★  The importer names
     Blender materials "<file>.<index>" (main.py:833) and wires no image, so the exported
@@ -1350,6 +1383,280 @@ def inject_material_extras(path, map_of):
     if unmatched:
         log("  note: {} material name(s) had no trailing .dts index: {}"
             .format(len(unmatched), unmatched[:4]))
+
+
+def strip_material_images(contract):
+    """Unlink every image texture from every material, in the IMPORTED SCENE only.
+
+    ★A DTS-derived GLB must reference no image, and this is the only way to get there
+    without losing the materials themselves.★
+
+    The importer resolves a sibling .png next to the .dts, so any shape shipping one
+    exports real embedded images by default.  chaingun is the first such asset -- it has
+    chaingun.png and pulse.png beside it, and the default export produced 3 images and
+    4 textures.
+
+    Embedding them is not merely wasteful, it is WRONG.  The engine never decodes glTF
+    image buffer views; it reads `image.uri` (or `image.name`) as a ResourceManager
+    FILENAME and falls back to `dtsMapFile` only when there is no image reference at all
+    (ts_gltf.cpp:792-818).  So an embedded image OUTRANKS the authoritative map name and
+    resolves to a texture that does not exist.  It also freezes per-player skin remap,
+    which rewrites the <skinbase>.<armour>.BMP prefix at runtime.
+
+    ★MEASURED: export_materials='PLACEHOLDER' is NOT the answer.★  The audit suggested it
+    first, conditional on it preserving material slots and names.  It does not: on
+    chaingun it produced `"materials": []` and stripped the `material` key from all 20
+    primitives, so every face→material assignment was lost -- strictly worse than
+    embedding.  Unlinking the image nodes keeps the material list, the names (which carry
+    the .dts index), and the per-primitive assignment, and emits no images.
+
+    Nothing on disk is touched: this edits the in-memory scene Blender imported, and the
+    exporter runs immediately afterwards.  Every value that matters is already captured
+    in `contract` and is written back as extras.
+    """
+    stripped, mats = 0, 0
+    for mat in bpy.data.materials:
+        if not mat.use_nodes or not mat.node_tree:
+            continue
+        touched = False
+        for node in list(mat.node_tree.nodes):
+            if node.type == 'TEX_IMAGE':
+                # Unlink rather than delete: deleting can leave the Principled BSDF's
+                # Base Color unconnected in a way some exporter versions treat as an
+                # error, whereas an image-less TEX_IMAGE node simply exports nothing.
+                for link in list(node.outputs[0].links):
+                    mat.node_tree.links.remove(link)
+                node.image = None
+                stripped += 1
+                touched = True
+        if touched:
+            mats += 1
+    log("textures   : unlinked {} image node(s) across {} material(s) -- the GLB will "
+        "reference NO image; dtsMapFile is authoritative ({})"
+        .format(stripped, mats,
+                ", ".join(sorted(set(m["mapFile"] for m in contract.materials
+                                     if m["mapFile"]))) or "none named"))
+
+
+def inject_contract_extras(path, contract, one_lod=False,
+                           allow_partial_twosided=False):
+    """Write DTS contract v1 into the GLB: root, animation, material and object extras.
+
+    Returns 0 on success, a nonzero exit code on a hard failure.
+
+    ★Material identity is the .dts index, not glTF array position.★  The importer names
+    Blender materials "<file>.<dtsIndex>" (main.py:833) and Blender exports only the
+    materials that are actually USED, so the correspondence is not positional --
+    tr_talon exports 16 glTF materials against 21 in the .dts.  The trailing integer
+    recovers the source index; `dtsMaterialIndex` then records it explicitly so the
+    loader never has to parse a name.
+
+    ★Object identity is the source object index.★  Cel tracks used to be matched by
+    Blender/glTF object NAME, which is unsafe in general: Blender appends `.001` to
+    duplicates, and a dict keyed by name silently collapses them.  Matching is done here
+    by name ONLY when every source object name is unique, and a duplicate is a hard
+    failure rather than a quiet mismatch.  (Attaching the index as a custom property at
+    import time would remove the name dependency entirely; that is a change to main.py
+    and is deliberately not bundled into this commit.)
+    """
+    try:
+        js, chunks, _raw = gce.readGlb(path)
+    except gce.ExtrasError as e:
+        log("!! {}".format(e))
+        return 14
+
+    # -- texture exclusion, before anything else ------------------------------
+    try:
+        gce.assertNoEmbeddedImages(js)
+    except gce.ExtrasError as e:
+        log("!! FAIL: {}".format(e))
+        return 15
+
+    nodes = js.get("nodes", [])
+
+    # -- root node ------------------------------------------------------------
+    root = gce.soleRootIndex(js)
+    if root is None:
+        log("!! FAIL: the scene does not have exactly ONE root node, so there is "
+            "nowhere to put the shape contract and ts_gltf would synthesise a 'bounds' "
+            "root -- which LOSES ROOT MOTION (walk animations are never picked).")
+        return 16
+    try:
+        nodes[root].setdefault("extras", {}).update(gce.rootExtras(contract))
+    except gce.ExtrasError as e:
+        log("!! FAIL: root extras: {}".format(e))
+        return 17
+    log("contract v{}: root node '{}' carries source v{}, radius {:.6g}, bounds {}"
+        .format(gce.CONTRACT_VERSION, nodes[root].get("name"), contract.version,
+                contract.shape["radius"],
+                "exact" if contract.shape["hasExactBounds"] else "NOT IN SOURCE (v<8)"))
+
+    # -- materials ------------------------------------------------------------
+    # ★A count of zero must FAIL, not pass quietly.★  The first run of this gate
+    # reported "0 of 4 source material(s) carried" and returned success, because
+    # export_materials='PLACEHOLDER' had emitted an EMPTY material array -- so the loop
+    # below never executed, `unmatched` stayed empty, and every check downstream of it
+    # was vacuously true.  A gate whose silence can mean "nothing to check" is not a
+    # gate.  Assert the population before inspecting it.
+    glbMats = js.get("materials", [])
+    if contract.materials and not glbMats:
+        log("!! FAIL: the source has {} material(s) but the GLB has NONE, so every face "
+            "would fall back to a generated default material."
+            .format(len(contract.materials)))
+        return 25
+    noMat = []
+    for mi, mesh in enumerate(js.get("meshes", [])):
+        for pi, prim in enumerate(mesh.get("primitives", [])):
+            if "material" not in prim:
+                noMat.append("%s/prim%d" % (mesh.get("name", mi), pi))
+    if contract.materials and noMat:
+        log("!! FAIL: {} primitive(s) carry no material assignment: {} -- face->material "
+            "mapping is part of the contract, not a cosmetic detail."
+            .format(len(noMat), noMat[:6]))
+        return 26
+
+    # ★Correct the blanket doubleSided the importer stamps on every material.★  The
+    # loader now expands a doubleSided material into both windings (which is what a .dts
+    # two-sided card actually is), so leaving the flag on everything would double the
+    # entire model's face count.  Measure it from the source instead.
+    twoSided = gce.doubleSidedMaterials(contract)
+
+    # ★A PARTIALLY two-sided material cannot be represented, and must not be papered over.★
+    #
+    # glTF expresses two-sidedness per MATERIAL; a .dts expresses it per FACE.  When every
+    # face of a material is a mirrored pair (chaingun's muzzle flashes) the two models
+    # agree exactly.  When only SOME are -- mortar_turret has 4 such faces -- neither
+    # answer is right: flagging the material doubles every other face, and not flagging it
+    # drops the second side of geometry the artist deliberately made two-sided.
+    #
+    # Silently choosing the second is what happened before this check existed, and it is
+    # invisible: the shape renders correctly from most angles.
+    topo = gce.faceTopologyReport(contract)
+    partial = sum(t["partialTwoSidedFaces"] for t in topo)
+    if partial and allow_partial_twosided:
+        log("note       : {} face(s) are two-sided in a single-sided material and will "
+            "render from ONE side only -- accepted via --allow-partial-twosided, so this "
+            "artifact is NOT an exact conversion.".format(partial))
+    elif partial and not one_lod:
+        log("!! FAIL: {} face(s) are two-sided in the source but belong to a material "
+            "whose other faces are single-sided. glTF carries doubleSided PER MATERIAL, "
+            "so this cannot be represented exactly and one side would be silently lost."
+            .format(partial))
+        for t in topo:
+            if t["partialTwoSidedFaces"]:
+                log("     mesh {}: {} of {} face(s)".format(
+                    t["mesh"], t["partialTwoSidedFaces"], t["faces"]))
+        return 28
+    redundant = sum(t["redundantFaces"] for t in topo)
+    if redundant:
+        # Provably inert: same triangle, same winding, same material -- identical pixels
+        # drawn twice.  Reported so the round-trip gate can account for it exactly.
+        log("note       : {} redundant duplicate face(s) in the source will collapse on "
+            "import (identical winding + material -- provably no visual change)"
+            .format(redundant))
+
+    tagged, unmatched = 0, []
+    for m in glbMats:
+        idx = trailing_int(m.get("name"))
+        if idx is None or not (0 <= idx < len(contract.materials)):
+            unmatched.append(m.get("name"))
+            continue
+        try:
+            m.setdefault("extras", {}).update(gce.materialExtras(contract, idx))
+        except gce.ExtrasError as e:
+            log("!! FAIL: material {}: {}".format(m.get("name"), e))
+            return 18
+        m["doubleSided"] = (idx in twoSided)
+        tagged += 1
+    if unmatched:
+        log("!! FAIL: {} glTF material(s) carry no resolvable .dts index: {} -- a "
+            "material with no source identity cannot be restored exactly, and the "
+            "loader would fall back to inventing one."
+            .format(len(unmatched), unmatched[:6]))
+        return 19
+    if tagged != len(contract.materials):
+        if one_lod:
+            log("note       : {} of {} source material(s) carried -- the rest are used "
+                "only by detail levels --one-lod dropped (LOSSY profile)."
+                .format(tagged, len(contract.materials)))
+        else:
+            log("!! FAIL: only {} of {} source material(s) reached the GLB. A material "
+                "that never arrives cannot be restored, and anything addressing it by "
+                "SOURCE index (cel/IFL material animation) would resolve to the wrong "
+                "one.".format(tagged, len(contract.materials)))
+            return 29
+    log("materials  : {} of {} source material(s) carried with full Params; "
+        "two-sided (mirrored-pair) source material(s): {}"
+        .format(tagged, len(contract.materials),
+                sorted(twoSided) if twoSided else "none"))
+
+    # -- animations -----------------------------------------------------------
+    for a in js.get("animations", []):
+        ex = gce.animationExtras(contract, a.get("name"))
+        if ex is None:
+            log("!! FAIL: exported animation {!r} does not name a source sequence"
+                .format(a.get("name")))
+            return 20
+        a.setdefault("extras", {}).update(ex)
+    nTrig = sum(len(s) for s in [contract.frameTriggers])
+    log("animations : {} clip(s) carry cyclic/priority/duration, {} frame trigger(s)"
+        .format(len(js.get("animations", [])), nTrig))
+
+    # -- object identity ------------------------------------------------------
+    dupes = contract.duplicateObjectNames()
+    if dupes:
+        log("!! FAIL: the source has duplicate OBJECT name(s) {} -- cel tracks and "
+            "object identity are matched by name here, and duplicates would be "
+            "silently misrouted.".format(dupes))
+        return 21
+
+    byName = dict((o["name"], o["index"]) for o in contract.objects)
+    matched = set()
+    for n in nodes:
+        if "mesh" not in n:
+            continue
+        base = (n.get("name") or "")
+        # Blender disambiguates a re-used name with a '.001' suffix; strip one such
+        # suffix before matching, but only when the stem actually names a source object.
+        cand = base
+        if cand not in byName and "." in cand and cand.rsplit(".", 1)[1].isdigit():
+            cand = cand.rsplit(".", 1)[0]
+        if cand in byName:
+            n.setdefault("extras", {})["dtsSourceObjectIndex"] = byName[cand]
+            matched.add(byName[cand])
+
+    # ★The "bounds" object is EXPECTED to be absent, and that is not a loss.★
+    #
+    # A stock .dts carries an invisible AABB proxy object on node 0, and the engine
+    # derives fRadius/fCenter/fBounds from its box.  It is never drawn: rendering walks
+    # from a DETAIL ROOT node, and node 0 is not one (chaingun's detail roots are
+    # 'chaingun 32/24/4/2').  The exact box now travels as dtsBoundsMin/Max on the root
+    # node instead, and the engine already handles a shape whose node 0 owns no object
+    # -- ts_shadow.cpp:692 falls back to shape->getShapeBox(), which it documents as
+    # EXACT rather than approximate for precisely this reason.
+    #
+    # Accounting for it explicitly matters: a bare "20/21" is indistinguishable from
+    # having silently dropped a real piece of geometry.
+    boundsObjs = set(o["index"] for o in contract.objects if o["name"].lower() == "bounds")
+    missing = [o for o in contract.objects
+               if o["index"] not in matched and o["index"] not in boundsObjs]
+    if missing and one_lod:
+        # --one-lod drops whole detail levels by design, so objects at those details are
+        # SUPPOSED to disappear.  That is the definition of the lossy profile, and it is
+        # exactly why such an artifact can never carry an exact-conversion label.
+        log("note       : {} source object(s) dropped by --one-lod (a deliberately LOSSY "
+            "profile): {}".format(len(missing), [o["name"] for o in missing][:6]))
+    elif missing:
+        log("!! FAIL: {} source object(s) did not survive into the GLB: {} -- geometry "
+            "loss, not a bounds proxy."
+            .format(len(missing), [o["name"] for o in missing][:6]))
+        return 27
+    log("objects    : {}/{} source object(s) carry dtsSourceObjectIndex ({} 'bounds' "
+        "proxy object(s) intentionally not exported -- exact bounds travel as root "
+        "extras)".format(len(matched), len(contract.objects), len(boundsObjs)))
+
+    gce.writeGlb(path, js, chunks)
+    return 0
 
 
 def dts_cel_tracks(path):
@@ -1501,7 +1808,7 @@ def dts_cel_tracks(path):
 _CEL_DELIMS = ';=|,"\\'
 
 
-def inject_cel_extras(path, tracks):
+def inject_cel_extras(path, tracks, contract=None, one_lod=False):
     """Carry the .dts cel tracks into the GLB as NODE extras.
 
     Mapping is exact and needs no heuristic: the exported glTF node name IS the .dts
@@ -1515,11 +1822,12 @@ def inject_cel_extras(path, tracks):
         "seqName=pos,flags,keyValue,matIndex|pos,...;seqName2=..."
     """
     if not tracks:
-        return
+        return 0                              # this shape genuinely has no cel tracks
     with open(path, 'rb') as f:
         data = f.read()
     if data[0:4] != b'glTF':
-        return
+        log("!! FAIL: cel injection: {} is not a binary glTF".format(path))
+        return 30
     off, chunks, js = 12, [], None
     while off + 8 <= len(data):
         clen, ctype = struct.unpack_from('<I4s', data, off)
@@ -1532,7 +1840,8 @@ def inject_cel_extras(path, tracks):
         else:
             chunks.append([ctype, chunk])
     if js is None or not js.get('nodes'):
-        return
+        log("!! FAIL: cel injection: no JSON chunk or no nodes")
+        return 31
 
     by_name = {}
     for n in js['nodes']:
@@ -1558,10 +1867,33 @@ def inject_cel_extras(path, tracks):
         node.setdefault('extras', {})['dtsCel'] = ';'.join(parts)
         tagged += 1
 
+    # ★Every one of these used to log and return SUCCESS.★  A cel track is not
+    # decoration: fVisible defaults to !DefaultInvisible (ts_shapeInst.cpp:797), so a
+    # missing visibility track leaves EVERY keyed object permanently visible -- the
+    # destroyed mortar turret draws its intact body and its wreckage in the same place,
+    # and a door renders open and closed at once.  Losing one silently, under exit 0, is
+    # the exact failure mode this converter exists to prevent.
     if not tagged:
-        log("  !! no glTF node matched a .dts object with cel tracks -- visibility/"
-            "frame animation is LOST (objects: {})".format(sorted(tracks)[:6]))
-        return
+        log("!! FAIL: no glTF node matched a .dts object with cel tracks -- visibility/"
+            "frame animation would be LOST (objects: {})".format(sorted(tracks)[:6]))
+        return 32
+    if refused:
+        log("!! FAIL: {} object(s) REFUSED -- a name contains an encoding delimiter "
+            "({!r}): {}".format(len(refused), _CEL_DELIMS, refused[:4]))
+        return 33
+    if unmatched:
+        # --one-lod DELIBERATELY drops the lower detail levels, so objects vanishing is
+        # its documented policy, not a defect.  It is a lossy profile and cannot carry an
+        # "exact round trip" label -- but it must not be failed here for doing what it
+        # was asked to do.
+        if one_lod:
+            log("  note: {} object(s) with cel tracks have no node in the GLB (dropped "
+                "by --one-lod, a deliberately LOSSY profile): {}"
+                .format(len(unmatched), unmatched[:6]))
+        else:
+            log("!! FAIL: {} object(s) with cel tracks have no node in the GLB, so their "
+                "animation is lost: {}".format(len(unmatched), unmatched[:6]))
+            return 34
 
     new_json = json.dumps(js, separators=(',', ':')).encode('utf-8')
     while len(new_json) % 4:
@@ -1578,12 +1910,99 @@ def inject_cel_extras(path, tracks):
 
     log("cel extras: {} of {} object(s) with tracks carried, {} keyframe(s)"
         .format(tagged, len(tracks), keys_out))
+    return 0
+
+
+def inject_object_flag_extras(path, flags_of, one_lod=False):
+    """Carry each .dts object's FLAGS word into the GLB as a node extra.
+
+    ★Default visibility is not the same thing as a visibility track, and carrying only
+    the track loses half the state.★  ShapeObjectInstance::animate seeds every frame
+    with `fVisible = !(fFlags & DefaultInvisible)` (ts_shapeInst.cpp:799) and only then
+    lets a SUBSCRIBED thread's cel keys override it.  So an object whose cel track lives
+    in a different sequence than the one currently playing keeps that seed.
+
+    Measured cost of losing it, over the 800-shape stock+RPG corpus: 12 shapes, 94
+    objects carry the bit, and every one of them is a muzzle-flash or effect card --
+    chaingun (9), boomer/cheeexp/rocketo (18 each), cyborggun (9), shotgun/repairgun (6),
+    mortargun (3), paintgun/sniper/shockwave_large (2), pulse (1).  The chaingun is the
+    one that got reported: its `hide muzzle *` objects are keyed only in `fire`, equipping
+    plays `activation` (playerInventory.cpp:971), so with the flag dropped the flash drew
+    permanently from the moment the weapon was drawn.
+
+    Emitted for EVERY object that has a node, including flags == 0, so the contract is
+    explicit rather than inferred from absence -- the loader can then tell "this shape
+    was converted before the flags existed" (no extra anywhere) from "this object is
+    genuinely visible by default" (extra present, zero).
+    """
+    if not flags_of:
+        return 0
+    with open(path, 'rb') as f:
+        data = f.read()
+    if data[0:4] != b'glTF':
+        log("!! FAIL: object-flag injection: {} is not a binary glTF".format(path))
+        return 35
+    off, chunks, js = 12, [], None
+    while off + 8 <= len(data):
+        clen, ctype = struct.unpack_from('<I4s', data, off)
+        off += 8
+        chunk = data[off:off + clen]
+        off += clen
+        if ctype == b'JSON':
+            js = json.loads(chunk.decode('utf-8'))
+            chunks.append([ctype, None])
+        else:
+            chunks.append([ctype, chunk])
+    if js is None or not js.get('nodes'):
+        log("!! FAIL: object-flag injection: no JSON chunk or no nodes")
+        return 36
+
+    by_name = {}
+    for n in js['nodes']:
+        if n.get('name'):
+            by_name.setdefault(n['name'], n)
+
+    tagged, invisible, unmatched = 0, 0, []
+    for objname in sorted(flags_of):
+        fl = int(flags_of[objname]) & 0xFFFF
+        node = by_name.get(objname)
+        if node is None:
+            if fl & 1:
+                unmatched.append(objname)      # only a LOST hidden object matters
+            continue
+        node.setdefault('extras', {})['dtsObjectFlags'] = fl
+        tagged += 1
+        if fl & 1:
+            invisible += 1
+
+    # A default-invisible object whose node did not survive is a real loss ONLY outside
+    # --one-lod, which drops lower detail levels as documented policy.
     if unmatched:
-        log("  note: {} object(s) with cel tracks have no node in the GLB (dropped "
-            "by --one-lod): {}".format(len(unmatched), unmatched[:6]))
-    if refused:
-        log("  !! {} object(s) REFUSED -- a name contains an encoding delimiter "
-            "({!r}): {}".format(len(refused), _CEL_DELIMS, refused[:4]))
+        if one_lod:
+            log("  note: {} default-invisible object(s) have no node (dropped by "
+                "--one-lod, a lossy profile): {}".format(len(unmatched), unmatched[:6]))
+        else:
+            log("!! FAIL: {} default-invisible object(s) have no node in the GLB, so "
+                "they would render permanently visible: {}"
+                .format(len(unmatched), unmatched[:6]))
+            return 37
+
+    new_json = json.dumps(js, separators=(',', ':')).encode('utf-8')
+    while len(new_json) % 4:
+        new_json += b' '
+    out = bytearray()
+    for ctype, payload in chunks:
+        body = new_json if ctype == b'JSON' else payload
+        if ctype != b'JSON':
+            while len(body) % 4:
+                body = body + b'\x00'
+        out += struct.pack('<I4s', len(body), ctype) + body
+    with open(path, 'wb') as f:
+        f.write(struct.pack('<4sII', b'glTF', 2, 12 + len(out)) + bytes(out))
+
+    log("object flags: {} object(s) carried ({} default-invisible)"
+        .format(tagged, invisible))
+    return 0
 
 
 def inject_sequence_extras(path, cyclic_of, prio_of):
@@ -1902,7 +2321,9 @@ def glb_animation_names(path):
 
 
 def main():
-    src, dst, one_lod = parse_args()
+    global _DST
+    src, dst, one_lod, allow_partial_twosided = parse_args()
+    _DST = dst
     log("=" * 70)
     log("IN : {}  ({} bytes)".format(src, os.path.getsize(src)))
     log("OUT: {}".format(dst))
@@ -1974,26 +2395,56 @@ def main():
             log("!! which the engine cannot bind (see this file's header). Aborting.")
             return 6
 
-    parsed = dts_sequence_owner_counts(src)
-    if parsed is None:
-        log("  !! sequence table unreadable -- every node will own every sequence,")
-        log("  !! which lets the view thread ('looks') pin nodes the walk should drive,")
-        log("  !! and clip durations will come from frame counts rather than the .dts.")
-        count_of, dur_of, owned = {}, {}, None
-        durations = None
-        cyclic_of, prio_of = {}, {}
-    else:
-        counts, durations, owned, seq_names, cyclics, priorities = parsed
-        # Key everything by sequence NAME.  Marker INDEX is not a safe key: this
-        # shape has 44 sequences and 43 timeline markers, so one unmarked sequence
-        # shifts every index after it.
-        if seq_names:
-            count_of = dict(zip(seq_names, counts))
-            dur_of = dict(zip(seq_names, durations))
-            cyclic_of = dict(zip(seq_names, cyclics))
-            prio_of = dict(zip(seq_names, priorities))
-        else:
-            count_of, dur_of, cyclic_of, prio_of = {}, {}, {}, {}
+    # ---- THE ONE authoritative read of the source ------------------------------
+    #
+    # ★This used to call `dts_sequence_owner_counts(src)`, a SECOND independent walk of
+    # the DTS offset chain, with `dts_cel_tracks(src)` making a THIRD.★  Adding a shared
+    # reader while the converter kept calling the old ones is not consolidation -- it is
+    # the same divergence risk with an extra module in front of it.
+    #
+    # Both old paths also degraded SILENTLY, which is worse than diverging: an unreadable
+    # sequence table fell back to "every node owns every sequence" (which is exactly what
+    # lets the view thread 'looks' pin nodes the walk should drive), and a disagreement
+    # between the two walks dropped every cel track and carried on to a zero exit.
+    #
+    # A source that cannot be read exactly now stops the run here, before Blender spends
+    # time exporting a file that could never pass the gates.
+    try:
+        contract = dts_contract.load(src)
+    except dts_contract.UnsupportedSource as e:
+        log("!! source is not supported by the contract reader: {}".format(e))
+        return 12
+    except dts_contract.ContractError as e:
+        log("!! source could not be read exactly: {}".format(e))
+        return 11
+    if contract.defects:
+        log("!! FAIL: the source carries {} contract defect(s), so a round trip cannot "
+            "be exact:".format(len(contract.defects)))
+        for d in contract.defects[:8]:
+            log("     [{}] {}".format(d["code"], d["detail"]))
+        return 13
+
+    seq_names = [s["name"] for s in contract.sequences]
+    durations = [s["duration"] for s in contract.sequences]
+    # Key by sequence NAME.  Marker INDEX is not a safe key: rpgmalehuman has 44
+    # sequences and 43 timeline markers, so one unmarked sequence shifts every index
+    # after it.
+    dur_of = dict((s["name"], s["duration"]) for s in contract.sequences)
+    cyclic_of = dict((s["name"], s["cyclic"]) for s in contract.sequences)
+    prio_of = dict((s["name"], s["priority"]) for s in contract.sequences)
+    owned = contract.nodeOwnership()
+    count_of = dict((nm, sum(1 for (_n, s) in owned if s == nm)) for nm in seq_names)
+
+    log("contract: DTS v{} -- {} node(s), {} object(s), {} material(s), {} sequence(s) "
+        "-- ONE reader, no silent fallback".format(
+            contract.version, len(contract.nodes), len(contract.objects),
+            len(contract.materials), len(contract.sequences)))
+    _dupes = contract.duplicateSequenceNames()
+    if _dupes:
+        log("  note: duplicate sequence name(s) {} -- {} sequences collapse to {} "
+            "distinct clips. Fine for a player (slot-based wire); NOT fine for a "
+            "station/vehicle, where index 0..15 is a wire contract."
+            .format(_dupes, len(seq_names), len(set(seq_names))))
     # ★Pick the sampling rate against BOTH ends of the squeeze.★
     #
     # Too low and a short sequence collapses: retiming at Blender's default 24 fps
@@ -2032,6 +2483,28 @@ def main():
             int(fps), shortest, shortest * fps))
     build_nla_tracks(ranges, count_of, dur_of, fps, owned)
     flip_winding_to_gltf_ccw()
+
+    # ---- DTS contract v1: read the source ONCE, through the authoritative parser ----
+    # Loaded here rather than after export because strip_material_images() needs it, and
+    # because a source that cannot be read exactly should stop the run BEFORE Blender
+    # spends time exporting a file that can never pass the gates.
+    try:
+        contract = dts_contract.load(src)
+    except dts_contract.UnsupportedSource as e:
+        log("!! source is not supported by the contract reader: {}".format(e))
+        return 12
+    except dts_contract.ContractError as e:
+        log("!! source could not be read exactly: {}".format(e))
+        return 11
+    if contract.defects:
+        # An asset with defects is an EXPLICIT exclusion, never a silent pass.
+        log("!! FAIL: the source carries {} contract defect(s), so a round trip cannot "
+            "be exact:".format(len(contract.defects)))
+        for d in contract.defects[:8]:
+            log("     [{}] {}".format(d["code"], d["detail"]))
+        return 13
+
+    strip_material_images(contract)
     # Strips now start at frame 0, and the exporter bakes each track over its own
     # strip range -- so the scene range has to include 0 or the first key is cut.
     bpy.context.scene.frame_start = 0
@@ -2041,6 +2514,10 @@ def main():
         bpy.ops.export_scene.gltf(
             filepath=dst,
             export_format='GLB',
+            # Materials are exported normally, with their image nodes already unlinked
+            # by strip_material_images() -- see that function for why, and for the
+            # measurement that ruled out export_materials='PLACEHOLDER'.
+            export_materials='EXPORT',
             use_selection=False,
             export_apply=False,
             export_animations=True,
@@ -2078,25 +2555,47 @@ def main():
     # Both post-passes run AFTER decimation, which rewrites the whole container --
     # anything written earlier would be dropped when the JSON chunk is rebuilt.
     # Reorder BEFORE the extras so the extras land on the final animation list.
-    reorder_animations(dst, seq_names if parsed else None)
+    # seq_names is unconditional now: the contract either loaded exactly or the run
+    # already returned, so there is no "parsed or not" state left to branch on.
+    reorder_animations(dst, seq_names)
     inject_sequence_extras(dst, cyclic_of, prio_of)
-    inject_material_extras(dst, dts_material_maps(src))
+
+    # ---- DTS contract v1 -------------------------------------------------------
+    # `contract` was read before export (see above).  This carries the WHOLE record,
+    # replacing the old map-file-only injection that was itself fed by a byte-signature
+    # scan.  Everything the loader used to rebuild from `alphaMode` -- exact shading,
+    # transparent vs translucent, palette index, RGB, fAlpha, surface type, elasticity,
+    # friction, fUseDefaultProps -- now survives.
+    rc = inject_contract_extras(dst, contract, one_lod, allow_partial_twosided)
+    if rc:
+        return rc
 
     # Cel tracks last -- they key off the FINAL node list, and they carry sequence
     # NAMES, so they must be written after reorder_animations has settled the order.
-    cel_tracks, cel_seqnames = dts_cel_tracks(src)
-    if cel_seqnames is not None and parsed and seq_names is not None:
-        # ★Cross-check the two independent .dts walks against each other.★  This
-        # function repeats the header/table offset arithmetic that
-        # dts_sequence_owner_counts does, and two copies of the same arithmetic is
-        # exactly how a silent divergence starts.  If they ever disagree about the
-        # sequence table, say so and drop the cel tracks rather than write keys bound
-        # to the wrong sequence names.
-        if list(cel_seqnames) != list(seq_names):
-            log("  !! cel-track parse disagrees with the sequence-table parse "
-                "({} vs {}) -- cel tracks dropped".format(cel_seqnames, seq_names))
-            cel_tracks = None
-    inject_cel_extras(dst, cel_tracks)
+    #
+    # ★The cross-check against a second parser is GONE, because the second parser is
+    # gone.★  It compared `dts_cel_tracks`' sequence-name list against
+    # `dts_sequence_owner_counts`', and on disagreement DROPPED every cel track and
+    # continued to a zero exit -- turning a parser bug into a silent loss of the
+    # destruction swap, the door animation, and the muzzle flashes.  With one reader
+    # there is nothing to disagree with.
+    cel_tracks = {}
+    for oi, tracks in contract.celTracks().items():
+        name = contract.objects[oi]["name"]
+        cel_tracks[name] = dict((seq, [(k["pos"], k["flags"], k["keyValue"],
+                                        k["matIndex"]) for k in keys])
+                                for seq, keys in tracks.items())
+    rc = inject_cel_extras(dst, cel_tracks or None, contract, one_lod)
+    if rc:
+        return rc
+
+    # Object FLAGS ride alongside the cel tracks but are independent of them: an object
+    # can be default-invisible with no track at all, and the muzzle-flash cards are keyed
+    # only in `fire` while equip plays `activation`.  See inject_object_flag_extras.
+    rc = inject_object_flag_extras(
+        dst, dict((o["name"], o["flags"]) for o in contract.objects), one_lod)
+    if rc:
+        return rc
 
     names, js, raw, bin_off = glb_animation_names(dst)
     log("---- GLB ----")
@@ -2110,6 +2609,7 @@ def main():
     # most of its cycle frozen on the first pose and then blips.
     acc = js.get('accessors', [])
     late = []
+    mismatched = []
     for a in js.get('animations', []):
         lo = None
         for s in a.get('samplers', []):
@@ -2123,11 +2623,26 @@ def main():
                 hi = mx if hi is None else max(hi, mx)
         if lo is not None:
             want = dur_of.get(a.get('name'), 0.0)
-            log("    clip {:<14} {:.3f}..{:.3f}s   .dts says {:.3f}s  {}".format(
+            drift = abs((hi or 0.0) - want)
+            # ★A duration mismatch is FATAL, not a log line.★  It used to print
+            # "SPEED MISMATCH" and carry on, with a 0.05s tolerance -- which on
+            # chaingun's 0.2667s `fire` is nearly 19% of the whole clip.  fDuration is
+            # what every time->position ratio divides by, so drift here is drift in the
+            # playback SPEED of the animation, for good.  The tolerance is now one
+            # exported time quantum.
+            if want > 0 and drift > 1e-4:
+                mismatched.append((a.get('name'), hi or 0.0, want, drift))
+            log("    clip {:<14} {:.4f}..{:.4f}s   .dts says {:.4f}s  {}".format(
                 a.get('name'), lo, hi or 0.0, want,
-                "OK" if want <= 0 or abs((hi or 0.0) - want) < 0.05 else "SPEED MISMATCH"))
+                "OK" if want <= 0 or drift <= 1e-4
+                else "DURATION MISMATCH (%.6gs off)" % drift))
             if lo > 0.05:
                 late.append((a.get('name'), lo))
+    if mismatched:
+        log("!! FAIL: {} clip(s) do not match the .dts duration within 1e-4s; every "
+            "time->position ratio divides by fDuration, so this is a permanent "
+            "playback-speed error: {}".format(len(mismatched), mismatched))
+        return 22
     if late:
         log("!! FAIL: {} clip(s) do not start at 0 -- they will freeze then blip "
             "in game: {}".format(len(late), late))
@@ -2137,19 +2652,18 @@ def main():
     # one transform per sampled time, per (node, sequence); version 8 narrowed those
     # indices to Int16 so the loader stops at 32000 and DROPS the rest -- silently,
     # as far as the player is concerned.  Count what it will actually build.
-    kf_total = 0
-    for a in js.get('animations', []):
-        per_node = {}
-        for ch in a.get('channels', []):
-            nd = ch.get('target', {}).get('node')
-            cnt = acc[a['samplers'][ch['sampler']]['input']]['count']
-            per_node[nd] = max(per_node.get(nd, 0), cnt)
-        kf_total += sum(per_node.values())
-    log("  keyframes   : {} that ts_gltf will build (MaxKeyframes 32000, "
-        "MaxTransforms 65000)".format(kf_total))
+    # ★Count the UNION of timestamps, which is what the loader builds.★  The old
+    # estimate took max(translation, rotation) per node; buildAnimations merges their
+    # times.  Those differ whenever T and R are keyed at different instants -- which
+    # decimation makes the NORMAL case, because it fits each channel independently.  An
+    # undercount passes a file that the loader then truncates at the Int16 cap, and
+    # truncation is silent as far as the player is concerned.
+    kf_total = gce.totalLoaderKeys(js, raw)
+    log("  keyframes   : {} that ts_gltf will build, counted as the loader's timestamp "
+        "UNION (MaxKeyframes 32000, MaxTransforms 65000)".format(kf_total))
     if kf_total > 32000:
-        log("!! FAIL: over the Int16 keyframe cap -- ts_gltf would log \"animation data "
-            "exceeds the Int16 keyframe/transform indices\" and drop the remainder.")
+        log("!! FAIL: over the Int16 keyframe cap -- ts_gltf now REJECTS the whole "
+            "shape rather than dropping the remainder.")
         return 10
 
     vol, npos, nneg = glb_signed_volume(js, raw, bin_off)
@@ -2161,11 +2675,31 @@ def main():
         log("!! near faces culled, far faces visible through them.")
         return 8
 
-    # The point of the whole script: sequence names must survive.
-    want = set(n for n, _, _ in ranges)
-    got = set(names or [])
+    # The point of the whole script: sequence names must survive, ★IN ORDER★.
+    #
+    # This compared two SETS.  For a non-player shape, sequence indices 0..15 are a WIRE
+    # CONTRACT -- the server sends a slot number, not a name -- so a reordering that
+    # preserves every name still points the wire at the wrong animation, and a set
+    # comparison cannot see it.  An EXTRA clip shifts every index after it, so it is a
+    # round-trip failure too, not a note.
+    want_ordered = [s["name"] for s in contract.sequences]
+    got_ordered = list(names or [])
+    want = set(want_ordered)
+    got = set(got_ordered)
     missing = sorted(want - got)
     extra = sorted(got - want)
+
+    if not missing and not extra and got_ordered != want_ordered:
+        log("!! FAIL: every sequence NAME survived but the ORDER changed; indices 0..15 "
+            "are a wire contract for non-player shapes.")
+        log("     source   : {}".format(want_ordered))
+        log("     converted: {}".format(got_ordered))
+        return 23
+    if extra:
+        log("!! FAIL: {} clip(s) in the GLB do not come from a source sequence: {}. "
+            "Each one shifts every later sequence index."
+            .format(len(extra), extra))
+        return 24
     if missing:
         log("!! FAIL: {} sequence(s) lost in the round trip: {}".format(len(missing), missing))
         # KNOWN GAP (2026-07-25, tr_talon.dts): the LAST marked sequence,
@@ -2176,12 +2710,66 @@ def main():
         # Harmless for tr_talon because the engine never selects that sequence
         # (it is not in the Player anim-name list), but do not assume that of the
         # next shape: this check failing is a hard stop, by design.
-    if extra:
-        log("   note: {} clip(s) not from a marker: {}".format(len(extra), extra))
-    if missing:
         return 7
 
-    log("PASS: all {} DTS sequence name(s) survived into the GLB".format(len(want)))
+    log("internal gates PASS: all {} DTS sequence(s) survived in EXACT source order: {}"
+        .format(len(want_ordered), want_ordered))
+
+    # ---- EXTERNAL GATES ---------------------------------------------------------
+    #
+    # ★A converter that returns 0 without running the gates is not gated.★  All three of
+    # these existed and passed on chaingun -- but only when a human remembered to run them
+    # by hand, so `EXIT 0` really meant "the internal checks that happen to live in this
+    # file are satisfied".  That is exactly how a false PASS reaches a deploy.  Running
+    # them here makes exit 0 mean every gate ran AND every gate agreed.
+    #
+    # The round-trip gate is the strict FIDELITY one and cannot apply to a deliberately
+    # lossy profile: --one-lod drops whole detail levels by design.
+    gates = [
+        ("compatibility", [sys.executable, "-B",
+                           os.path.join(_TOOLS_DIR, "check_sequence_contract.py"),
+                           "--compat", src, dst]),
+        ("cel tracks", [sys.executable, "-B",
+                        os.path.join(_TOOLS_DIR, "check_cel_tracks.py"), src, dst]),
+    ]
+    if one_lod or allow_partial_twosided:
+        log("  note: this is a LOSSY profile ({}) -- the round-trip fidelity gate does "
+            "not apply, and this artifact must NOT be labelled an exact conversion."
+            .format("--one-lod" if one_lod else "--allow-partial-twosided"))
+    else:
+        gates.insert(0, ("round-trip fidelity",
+                         [sys.executable, "-B",
+                          os.path.join(_TOOLS_DIR, "check_roundtrip_contract.py"),
+                          src, dst]))
+
+    import subprocess
+    for label, cmd in gates:
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True)
+        except Exception as e:
+            log("!! FAIL: could not run the {} gate: {}".format(label, e))
+            return 40
+        if p.returncode != 0:
+            log("!! FAIL: the {} gate rejected this conversion (exit {}):"
+                .format(label, p.returncode))
+            for line in ((p.stdout or "") + (p.stderr or "")).strip().splitlines()[:12]:
+                log("     {}".format(line))
+            # ★Never leave a deployable artifact behind a failed gate.★  Renaming keeps
+            # the evidence for diagnosis while making it impossible to copy the file into
+            # a playable tree out of muscle memory.
+            failed = dst + ".failed.glb"
+            try:
+                if os.path.exists(failed):
+                    os.remove(failed)
+                os.rename(dst, failed)
+                log("     output renamed to {} -- NOT deployable".format(failed))
+            except Exception as e:
+                log("     (could not rename the failed output: {})".format(e))
+            return 41
+        log("gate PASS: {}".format(label))
+
+    log("ALL GATES PASS -- {} is an exact conversion of {}"
+        .format(os.path.basename(dst), os.path.basename(src)))
     return 0
 
 
@@ -2191,5 +2779,33 @@ try:
 except Exception:
     traceback.print_exc()
     rc = 1
+
+# ★"Never leave a deployable artifact behind a failure" must be enforced at ONE choke
+# point, not per return site.★  It was originally written only into the external-gate
+# path (exit 41), so every INTERNAL gate -- partial-two-sided (28), duplicate object
+# names (21), unnamed animation (20), material ordering (29) -- returned nonzero while
+# leaving a plain .glb on disk indistinguishable from a passing one.
+#
+# Not hypothetical: it caused a real false report.  Ten failed conversions from the
+# 35-asset suite were read back off a directory listing and called clean, because
+# nothing about the filename said otherwise.  A failure that is visible ONLY in a
+# machine-readable exit code will eventually be read by a human looking at files.
+#
+# This covers every return site and the exception path, including ones added later.
+# The 41 path renames first, so it leaves nothing here to find.
+if rc != 0 and _DST and os.path.exists(_DST):
+    _failed = _DST + ".failed.glb"
+    try:
+        if os.path.exists(_failed):
+            os.remove(_failed)
+        os.rename(_DST, _failed)
+        log("output renamed to {} -- exit {} is a FAILURE, NOT deployable"
+            .format(_failed, rc))
+    except Exception as e:
+        log("!! could not quarantine the failed output {}: {}".format(_DST, e))
+        # A failed conversion left under a deployable name is worse than a nonzero exit
+        # on its own; make the exit code unmistakable.
+        rc = 42
+
 log("EXIT {}".format(rc))
 sys.exit(rc)
